@@ -6,6 +6,7 @@ Nothing above this module needs to know which operating system it is on.
 """
 import os
 import struct
+import ctypes
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,13 +73,8 @@ class Proc:
 
     # ---------- write ----------
     def write(self, addr, data):
-        buf = ctypes.create_string_buffer(data, len(data))
-        l = iovec(ctypes.cast(buf, ctypes.c_void_p), len(data))
-        r = iovec(ctypes.c_void_p(addr), len(data))
-        n = libc.process_vm_writev(self.pid, ctypes.byref(l), 1, ctypes.byref(r), 1, 0)
-        if n < 0:
-            raise OSError(ctypes.get_errno(), f"write {addr:#x}+{len(data)}")
-        return n
+        # delegate to the platform backend (defines iovec/libc itself)
+        return self.be.write(addr, data)
 
     # ---------- scan ----------
     def regions(self, writable=True, anon_only=False, min_size=0):

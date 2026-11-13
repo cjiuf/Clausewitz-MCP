@@ -8,9 +8,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Hearts%20of%20Iron%20IV-1.19.2-2b3440?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Hearts%20of%20Iron%20IV-1.19.4.1.99a5-2b3440?style=for-the-badge">
   <img src="https://img.shields.io/badge/MCP-2024--11--05-c8a04a?style=for-the-badge">
-  <img src="https://img.shields.io/badge/tools-107-2b3440?style=for-the-badge">
+  <img src="https://img.shields.io/badge/tools-149-2b3440?style=for-the-badge">
   <img src="https://img.shields.io/badge/dependencies-1-3d6b4a?style=for-the-badge">
   <img src="https://img.shields.io/badge/license-MIT-2b3440?style=for-the-badge">
 </p>
@@ -22,6 +22,24 @@
   <a href="#roadmap">Roadmap</a> ·
   <a href="research/FINDINGS.md">RE notes</a>
 </p>
+
+---
+
+> ### Fork note — `1.19.4.1.99a5`
+>
+> This is a fork of [smerss/Clausewitz-MCP](https://github.com/smerss/Clausewitz-MCP)
+> that tracks the **Linux x64** build of Hearts of Iron IV **1.19.4.1.99a5**
+> (Operation Postern) instead of 1.19.2. The upstream design is unchanged: reads come
+> from the live process, every action goes through `CCommandQueue` and is still checked
+> by the game's own `CanExecute`.
+>
+> It adds **42 tools (107 → 149)**, ~14k lines of game logic, a complete 1.19.4.1
+> offset/table set, and a batch of upstream bug fixes. See the
+> [`1.19.4.1.99a5` release](https://github.com/cjiuf/Clausewitz-MCP/releases) for the
+> full list.
+>
+> Still **Linux only** — the offset tables are ELF virtual addresses. A Windows port
+> needs `calling/process/windows.py` plus every table re-derived from `hoi4.exe`.
 
 ---
 

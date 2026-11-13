@@ -1,16 +1,14 @@
-"""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calling"))
-import config
-
-Extracts the signatures of all 370 CCommand classes from the binary.
+"""Extracts the signatures of all 370 CCommand classes from the binary.
 
 For each command:
   vtable, object size, ctor address and argument count, type id (vtable+0x60),
   the field offsets read inside Execute (vtable+0x50), and the functions it calls.
 """
 from __future__ import annotations
-import re, struct, subprocess, os, pickle
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calling"))
+import config
+import re, struct, subprocess, pickle
 
 BIN = config.binary_path(required=False)
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmdsigs.pkl")
@@ -21,6 +19,7 @@ VT_EXECUTE = 0x50
 
 def _u32(d, o): return struct.unpack_from("<I", d, o)[0]
 def _i32(d, o): return struct.unpack_from("<i", d, o)[0]
+
 
 
 class CommandScanner:

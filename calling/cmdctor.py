@@ -24,6 +24,21 @@ ARGREG = {"rsi": 1, "esi": 1, "sil": 1, "rdx": 2, "edx": 2, "dl": 2,
           "rcx": 3, "ecx": 3, "cl": 3, "r8": 4, "r8d": 4, "r8b": 4,
           "r9": 5, "r9d": 5, "r9b": 5}
 SIZE_OF = {"QWORD": 8, "DWORD": 4, "WORD": 2, "BYTE": 1}
+
+_ALIAS = {"eax": "rax", "ax": "rax", "al": "rax",
+          "ecx": "rcx", "cx": "rcx", "cl": "rcx",
+          "edx": "rdx", "dx": "rdx", "dl": "rdx",
+          "ebx": "rbx", "bx": "rbx", "bl": "rbx",
+          "esi": "rsi", "si": "rsi", "sil": "rsi",
+          "edi": "rdi", "di": "rdi", "dil": "rdi",
+          "ebp": "rbp", "esp": "rsp"}
+for _i in range(8, 16):
+    for _s in ("d", "w", "b"):
+        _ALIAS["r%d%s" % (_i, _s)] = "r%d" % _i
+
+
+def _norm(reg):
+    return _ALIAS.get(reg, reg)
 FMT = {8: "<q", 4: "<i", 2: "<h", 1: "<B"}
 
 
@@ -75,6 +90,19 @@ def parse_ctor(va, end):
         if m and m.group(2) in fieldptr:
             _emit(out, fieldptr[m.group(2)], SIZE_OF.get(m.group(1) or "QWORD", 8),
                   m.group(3), argof, derived)
+            continue
+        # Any other write to a register invalidates what we knew about it.
+        # 2026-11-10 (V2-06): without this, `xor eax,eax` / `mov rax,[rip+cmp_ptr]`
+        # left derived["rax"] pointing at an argument, so the next
+        # `mov [rdi+0x30],rax` was attributed to that argument — that is where the
+        # phantom duplicate handles in CAddAdvisorCommand / CAddProductionLineCommand
+        # came from.
+        m = re.match(r"(?:mov|movzx|movsx|lea|xor|add|sub|and|or|shl|shr|imul|movaps|"
+                     r"pxor)\s+(\w+),", t)
+        if m:
+            d = _norm(m.group(1))
+            derived.pop(d, None)
+            fieldptr.pop(d, None)
             continue
     seen, res = set(), []
     for off, sz, ai, kind in out:

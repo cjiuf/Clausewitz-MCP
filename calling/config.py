@@ -15,7 +15,7 @@ import platform
 import re
 
 WINDOWS = platform.system() == "Windows"
-EXE_NAME = "hoi4.exe" if WINDOWS else "hoi4"
+EXE_NAME = os.environ.get("HOI4_EXE") or ("hoi4.exe" if WINDOWS else "hoi4")
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -66,6 +66,17 @@ def find_game_dir():
     for d in _STEAM_DIRS + _extra_steam_libraries():
         if os.path.isdir(d):
             return d
+    # 2026-11-10: root often runs the MCP server while the game is installed under
+    # another user's home (WSL: /home/snow/.steam/debian-installation/...). Without
+    # this, legality.character_defs() / advisor loading crashed with
+    # "expected str, bytes or os.PathLike object, not NoneType".
+    import glob as _glob
+    for pat in ("/home/*/.steam/debian-installation/steamapps/common/Hearts of Iron IV",
+                "/home/*/.steam/steam/steamapps/common/Hearts of Iron IV",
+                "/home/*/.local/share/Steam/steamapps/common/Hearts of Iron IV"):
+        for d in _glob.glob(pat):
+            if os.path.isdir(d):
+                return d
     return None
 
 

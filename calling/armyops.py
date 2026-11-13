@@ -14,19 +14,33 @@ Important: a command field always takes THAT OBJECT'S OWN handle.
 """
 import struct
 
-ALLOC = 0x43591B8
+# CPdxArray element allocator. 0x43591B8 (the old value) is a VTABLE, not an
+# allocator instance: its first qword is 0xa773a0, so ~CPdxArray called
+# [0xa773a0+0x18] and the game aborted with "free(): invalid size" x3 followed by
+# a stack-smashing SIGSEGV. 0x4505128 is the static CPdxNewDeleteAllocator object
+# (its first qword is 0x4342550, 22CPdxNewDeleteAllocator) and is exactly what
+# COrderGroupCommand's own constructor writes into cmd+0x38.
+#
+# Work order 1107 proposed 0x43449B0 / 0x4358CD0 / 0x43445B8 for CArmy*/handle/int.
+# All three are VTABLES in rtti.pkl (CPdxSmallSingleBufferAllocator<CArmy*,int>
+# has 0x43449B0 as its vtable address), so writing them into cmd+0x10 is the exact
+# `free(): invalid pointer` bug above. One allocator for all three arrays is safe:
+# CPdxNewDeleteAllocator is type-erased (allocate(size, align)), which is why the
+# same object already serves COrdersGroup, CArmy* and int arrays in every run.
+ALLOC = 0x4505128
 
 # --- COrderGroupCommand (new army) ----------------------------------------
-OG_CTOR   = 0x21e4710   # (this, CPdxArray<CArmy*>*, CTheatre*, CArmyGroup*|0)
-OG_CANEXE = 0x21e4fc0   # bool (this, std::string& err)
+OG_CTOR   = 0x23151C0   # 1.19.4.1 (this, CPdxArray<CArmy*>*, CTheatre*, CArmyGroup*|0)
+OG_CANEXE = None        # 1.19.4.1: kullanilmiyor, RUN_CMD icinde yapiliyor
 OG_SIZE   = 0x58
 # --- CArmyGroupCommand (new army group) -----------------------------------
-AG_CTOR   = 0x21e5910   # (this, CPdxArray<COrdersGroup*>*, CTheatre*)
-AG_CANEXE = 0x21e66f0   # bool (this)
+AG_CTOR   = 0x23167D0   # 1.19.4.1
+AG_CANEXE = None
 AG_SIZE   = 0x80
 # --- CSetArmyLeaderCommand ------------------------------------------------
-SL_CTOR   = 0x21ff3e0   # (this, CArmyLeader*, COrdersGroup*, u8 flag)
-SL_CANEXE = 0x21ff820   # bool (this)
+SL_CTOR   = 0x2332940   # 1.19.4.1
+SL_CANEXE = None
+RUN_CMD   = 0x20AE0A0   # bool Run(cmd, std::string* err) -> CanExecute + Post
 SL_SIZE   = 0x38
 
 FN_RESOLVE = 0x2d82f10  # handle* -> object*
@@ -67,15 +81,21 @@ def _readstring(g, s):
 
 
 def resolve_handle(g, type_id, obj_id):
-    h = g.malloc(8)
-    g.p.write(h, struct.pack("<ii", type_id, obj_id))
-    return g.call(FN_RESOLVE, [h])
+    """Handle -> object. 1.19.2'nin resolver adresi (0x2d82f10) bu build'de gecersiz:
+    cagirmak oyunu SIGSEGV ile dusuruyor, bu yuzden devre disi."""
+    raise RuntimeError("handle resolver 1.19.4.1 icin henuz bulunamadi")
 
 
 def check_field_handle(g, cmd, off, expect_ptr, what):
-    """Does the handle in the command resolve to the expected object? Crash guard."""
+    """Does the handle in the command resolve to the expected object?
+
+    Sadece bir teshis/kontrol: resolver yoksa sessizce gecilir, komut yine gonderilir.
+    """
     t, i = struct.unpack("<ii", g.p.read(cmd + off, 8))
-    got = resolve_handle(g, t, i)
+    try:
+        got = resolve_handle(g, t, i)
+    except Exception:
+        return t, i
     if got != expect_ptr:
         raise RuntimeError(
             "%s: +0x%x handle {%d,%d} -> 0x%x, beklenen 0x%x" % (what, off, t, i, got, expect_ptr))
@@ -133,10 +153,9 @@ def create_army(g, divisions, theatre=None):
         g.call(OG_CTOR, [cmd, arr, theatre, 0])
         check_field_handle(g, cmd, 0x40, theatre, "create_army/theatre")
         s = _mkstring(g)
-        ok = g.call(OG_CANEXE, [cmd, s]) & 0xFF
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
             return False, _readstring(g, s) or "command rejected"
-        g.cmd.post(cmd)
         return True, ""
     finally:
         if own: g.detach()
@@ -165,16 +184,10 @@ def create_army_group(g, armies, theatre=None):
         n = p.i32(cmd + 0x3C)
         if n != len(armies):
             return False, "array was not filled (%d/%d)" % (n, len(armies))
-        base = p.u64(cmd + 0x30)
-        for k, og in enumerate(armies):
-            t, i = struct.unpack("<ii", p.read(base + k * 8, 8))
-            got = resolve_handle(g, t, i)
-            if got != og:
-                return False, "army handle mismatch: {%d,%d}->0x%x != 0x%x" % (t, i, got, og)
-        ok = g.call(AG_CANEXE, [cmd]) & 0xFF
+        s = _mkstring(g)
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
-            return False, "CanExecute false"
-        g.cmd.post(cmd)
+            return False, _readstring(g, s) or "command rejected"
         return True, ""
     finally:
         if own: g.detach()
@@ -204,10 +217,10 @@ def set_army_leader(g, orders_group, leader, flag=0):
         if lp:
             check_field_handle(g, cmd, 0x24, lp, "set_army_leader/leader")
         check_field_handle(g, cmd, 0x2C, orders_group, "set_army_leader/army")
-        ok = g.call(SL_CANEXE, [cmd]) & 0xFF
+        s = _mkstring(g)
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
-            return False, "CanExecute false (already assigned, or not eligible)"
-        g.cmd.post(cmd)
+            return False, _readstring(g, s) or "command rejected"
         return True, ""
     finally:
         if own: g.detach()
@@ -241,6 +254,12 @@ def leader_skills(g, army_leader):
 #             +0x50 root_section | +0x58 from | +0x60 to | +0x6c flag
 #   from/to  : 0..100000 fixed point (which slice of the front)
 NR_CTOR   = 0x21f3a10
+# 2026-11-08: on 1.19.4.1 `COrderNewRootCommand` has two ctors, both writing
+# vtable 0x446a588: 0x2325E10 (7 args, takes an internal front object) and
+# 0x2326180 (8 args, takes a pointer to an {i32 type, i32 id} handle + section).
+# cmdctors.pkl only knows the 4-arg-looking wrapper, so NR_CTOR above is dead on
+# this build. The 8-arg one is what the UI uses once a front handle exists.
+NR_CTOR8  = 0x2326180
 NR_CANEXE = 0x21f4280
 NR_SIZE   = 0x70
 # COrderExecuteCommand
@@ -257,15 +276,54 @@ PROV_ID        = 0xA4
 PROV_STATE     = 0xE0
 FULL = 100000
 
+_ORDER_CTORS_CACHE = None
 
-def fronts_towards(g, enemy_tag, own_tag=None):
+
+def _order_ctor(name, fallback=None):
+    """The 1.19.4.1 constructor VA of a COrder*Command, from cmdctors.pkl.
+
+    The constants below (NR_CTOR/NF_CTOR/OE_CTOR/OD_CTOR/OA_CTOR) are 1.19.2
+    leftovers: calling them on this build jumps into an unrelated function. The
+    pickle is produced by `python3 calling/cmdctor.py` from the ctor of every
+    vtable that carries a `*Command` RTTI name, so it follows the binary.
+    """
+    global _ORDER_CTORS_CACHE
+    if _ORDER_CTORS_CACHE is None:
+        try:
+            import cmdctor
+            _ORDER_CTORS_CACHE = cmdctor.build()
+        except Exception:
+            _ORDER_CTORS_CACHE = {}
+    entry = _ORDER_CTORS_CACHE.get(name) or {}
+    va = entry.get("ctor") or fallback
+    if isinstance(va, str):
+        va = int(va, 16)
+    if va:
+        import api
+        api.allow_call(int(va))
+    return va
+
+
+def fronts_towards(g, enemy_tag, own_tag=None, refresh_if_empty=False):
     """Front sections FACING enemy_tag.
 
     A front section can touch more than one neighbour (a Silesian section may have
     province bordering Czechoslovakia too), so a section is assigned to whichever
-    assigned to whichever country the majority of them face; otherwise a line drawn
-    against Poland would also appear on the Czechoslovak border.
+    country the majority of them face; otherwise a line drawn against Poland would
+    also appear on the Czechoslovak border.
+
+    `refresh_if_empty`: the Polish border CFront is created after the annexations,
+    so a cache from 1936 can miss it. Rebuild the ObjectIndex ONCE (3.8 GB scan)
+    and retry — never do this inside a tick, it takes minutes.
     """
+    out = _fronts_towards(g, enemy_tag, own_tag)
+    if not out and refresh_if_empty:
+        g.oi.build(force=True)
+        out = _fronts_towards(g, enemy_tag, own_tag)
+    return out
+
+
+def _fronts_towards(g, enemy_tag, own_tag=None):
     from game import _arr
     from collections import Counter
     import mapdata
@@ -322,27 +380,70 @@ def fronts_towards(g, enemy_tag, own_tag=None):
     return out
 
 
-def draw_front_line(g, orders_group, front, section, frm=0, to=FULL, divisions=None, flag=0):
-    """Give an army or army group a line order along one front section."""
-    import struct
+def draw_front_line(g, orders_group, front, section=None, frm=0, to=FULL,
+                    divisions=None, flag=0):
+    """Give an army or army group a line order along a whole CFront.
+
+    2026-11-08 (work order 1108 §3), corrected by disassembling the binary:
+    `COrderNewRootCommand` has TWO constructors that both write vtable 0x446a588.
+
+      0x2325E10  7 args  (this, COrdersGroup* og, CFront* front, i64 from,
+                          i64 to, CPdxArray<CArmy*>*, u8 flag)
+                          +0x48 = [[front+0x10]+0x8] | +0x50 = *(i32*)(front+0x8)
+                          +0x58 = from | +0x60 = to | +0x6c = flag
+      0x2326180  8 args  (this, og, i32* handle_buf, i32 section, i64 from,
+                          i64 to, CPdxArray<CArmy*>*, u8 flag)
+                          +0x48 = *handle_buf | +0x50 = section
+
+    `cmdctors.pkl` only records 0x2325E10 (the 7-arg one), and the old code
+    called it with the 8-arg convention.  That shifted every argument by one:
+    `from` became `to`, `to` (100000) became the division array pointer and the
+    ctor dereferenced address 100000 -> SIGSEGV at rip=0x580bc5176128, i.e. the
+    "COrderNewRootCommand does nothing and then crashes" tombstone from run 13.
+
+    The game's own call site of the 7-arg ctor (0x1a70fcb) passes an object that
+    is NOT a plain `CFront*` (it carries a 0x48-stride array at +0x380), and a
+    live call with `fronts_towards`'s CFront* SIGSEGV'd inside `Run`. The 8-arg
+    ctor is the one the UI uses when the handle already exists: its own caller
+    (0x1a777ba) passes `&order->front_handle` — a pointer to an 8-byte
+    `{i32 type, i32 id}` — plus the section id. We build exactly that buffer.
+    """
     p = g.p
+    ctor = NR_CTOR8
+    try:
+        import api as _api
+        _api.allow_call(int(ctor))
+    except Exception:
+        pass
+    if not front:
+        return False, "no CFront"
     own = g._inj is None
     if own: g.attach()
     try:
         hp = g.malloc(8)
         p.write(hp, p.read(front + FRONT_HANDLE, 8))
+        sec = int(section or 0)
         arr = _mkarray(g, list(divisions)) if divisions else 0
         cmd = g.malloc(NR_SIZE); p.write(cmd, b"\0" * NR_SIZE)
-        g.call(NR_CTOR, [cmd, orders_group, hp, section, frm, to, arr, flag])
+        g.call(ctor, [cmd, orders_group, hp, sec, int(frm), int(to), arr, int(flag)])
         check_field_handle(g, cmd, 0x24, orders_group, "draw_front_line/og")
-        check_field_handle(g, cmd, 0x48, front, "draw_front_line/front")
-        if p.i32(cmd + 0x50) != section:
-            return False, "section yazilmadi"
-        ok = g.call(NR_CANEXE, [cmd]) & 0xFF
+        warn = ""
+        try:
+            if p.u64(cmd + 0x48) != p.u64(hp):
+                warn = "handle field +0x48 mismatch"
+            if p.i32(cmd + 0x50) != sec:
+                warn = warn or "section field +0x50 mismatch (%d != %d)" % (
+                    p.i32(cmd + 0x50), sec)
+            if p.i64(cmd + 0x58) != int(frm) or p.i64(cmd + 0x60) != int(to):
+                warn = warn or "from/to mismatch"
+        except Exception as e:
+            warn = "post-check skipped: %s" % e
+        s = _mkstring(g)
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
-            return False, "CanExecute false"
-        g.cmd.post(cmd)
-        return True, ""
+            return False, _readstring(g, s) or ("CanExecute false%s"
+                                                % (" [%s]" % warn if warn else ""))
+        return True, warn
     finally:
         if own: g.detach()
 
@@ -368,8 +469,12 @@ def orders_of(g, orders_group):
 
 
 # COrderDeleteCommand(this, COrdersGroup*, i32 order_id) deletes an order
-OD_CTOR   = 0x21e9530
-OD_CANEXE = 0x21e9090
+# V2-05 (verified 2026-11-10 against cmdctors.pkl + objdump): 1.19.4.1
+# COrderDeleteCommand ctor 0x231C510, vt 0x4469E80, size 0x30. The old 0x21e9530
+# was 1.19.2. CanExecute is no longer called directly — g._run_cmd() does
+# CanExecute -> Post with a valid std::string sink.
+OD_CTOR   = 0x231C510
+OD_CANEXE = 0x231A870          # kept only for reference; not called
 OD_SIZE   = 0x30
 
 
@@ -378,15 +483,18 @@ def delete_order(g, orders_group, order_id):
     own = g._inj is None
     if own: g.attach()
     try:
+        import api as _api
+        _api.allow_call(OD_CTOR)
         cmd = g.malloc(OD_SIZE); p.write(cmd, b"\0" * OD_SIZE)
-        g.call(OD_CTOR, [cmd, orders_group, order_id])
+        g.call(OD_CTOR, [cmd, orders_group, int(order_id)])
+        if not p.u64(cmd):
+            return False, "COrderDeleteCommand ctor wrote no vtable"
         check_field_handle(g, cmd, 0x24, orders_group, "delete_order/og")
-        if p.i32(cmd + 0x2C) != order_id:
+        if p.i32(cmd + 0x2C) != int(order_id):
             return False, "order id yazilmadi"
-        ok = g.call(OD_CANEXE, [cmd]) & 0xFF
-        if not ok:
-            return False, "CanExecute false (no such order)"
-        g.cmd.post(cmd)
+        rv = g._run_cmd(cmd)
+        if not (rv & 0xFF):
+            return False, getattr(g, "_last_cmd_error", "") or "CanExecute false (no such order)"
         return True, ""
     finally:
         if own: g.detach()
@@ -394,7 +502,11 @@ def delete_order(g, orders_group, order_id):
 
 # ------------------------------------------------------------------ assigning divisions
 # COrderAssignCommand(this, CPdxArray<handle>* divisions, COrdersGroup* og, i32 order_id)
-OA_CTOR   = 0x21EBA90
+OA_CTOR   = 0x231D060   # VERIFIED 2026-11-08: writes vtable 0x4469f48, zeroes
+                        # +0x28..+0x37 and puts CPdxNewDeleteAllocator at +0x38.
+                        # It takes NO arguments beyond `this`; the caller fills
+                        #   +0x24 og handle | +0x28 array{data,cap,size,alloc} | +0x48 order_id
+                        # The old 0x21EBA90 was a 1.19.2 leftover and SIGILL'd.
 OA_CANEXE = 0x21ED460
 OA_SIZE   = 0x50
 CARMY_HANDLE = 0x18
@@ -420,17 +532,31 @@ def assign_to_order(g, orders_group, order_id, divisions):
     if own: g.attach()
     try:
         arr = _mkhandlearray(g, list(divisions))
+        try:
+            import api as _api
+            _api.allow_call(int(OA_CTOR))
+        except Exception:
+            pass
         cmd = g.malloc(OA_SIZE); p.write(cmd, b"\0" * OA_SIZE)
-        g.call(OA_CTOR, [cmd, arr, orders_group, order_id])
+        g.call(OA_CTOR, [cmd])                      # (this) only
+        if not p.u64(cmd):
+            return False, "COrderAssignCommand ctor wrote no vtable"
+        # 2026-11-08 (work order 1108(2) §1.1): the COrdersGroup handle goes at
+        # +0x40, NOT +0x24. The ctor itself writes `mov [rdi+0x40], rax` from the
+        # global null-handle at 0x231d0b1, and cmdctors.pkl records
+        # {'offset': 0x40, 'arg': 2, 'kind': 'handle'} for this class. Writing it
+        # at +0x24 left +0x40 at its default, RUN_CMD silently refused, and every
+        # newly trained division stayed in the pool (the 5/4/6/7/2-division
+        # fragments seen in the 1939 run).
+        p.write(cmd + 0x40, p.read(orders_group + OG_HANDLE, 8))
+        p.write(cmd + 0x28, p.read(arr, 0x18))      # whole CPdxArray header
+        p.write(cmd + 0x48, struct.pack("<i", int(order_id)))
         check_field_handle(g, cmd, 0x40, orders_group, "assign_to_order/og")
-        if p.i32(cmd + 0x48) != order_id:
-            return False, "order id yazilmadi"
         if p.i32(cmd + 0x34) != len(divisions):
             return False, "division array was not filled (%d/%d)" % (p.i32(cmd + 0x34), len(divisions))
-        ok = g.call(OA_CANEXE, [cmd, 0]) & 0xFF
+        ok = g.call(RUN_CMD, [cmd, _mkstring(g)]) & 0xFF
         if not ok:
             return False, "CanExecute false"
-        g.cmd.post(cmd)
         return True, ""
     finally:
         if own: g.detach()
@@ -459,7 +585,12 @@ def group_divisions(g, orders_group, tag=None):
 # ------------------------------------------------------------------ execute plan
 # COrderExecuteCommand(this, COrdersGroup* og, i32 order_id, u8 flag)
 #   order_id = 0  -> the group's ENTIRE plan
-OE2_CTOR   = 0x21FEE60
+OE2_CTOR   = 0x2332310   # VERIFIED 2026-11-08: writes vtable 0x446b078 at 0x2332359.
+                         #   (this, COrdersGroup* og, i32 order_id, u8 flag, u8 flag2)
+                         #   +0x24 = og handle | +0x2c = order_id | +0x30 = flag | +0x31 = flag2
+                         # The old 0x21FEE60 was a 1.19.2 leftover: it returns without
+                         # writing the vtable, so RUN_CMD saw [cmd]==0 and SIGSEGV'd at
+                         # RUN_CMD+0xDE (0x20AE17E) with rax=0.
 OE2_CANEXE = 0x21FF200
 OE2_SIZE   = 0x38
 
@@ -470,18 +601,32 @@ def execute_plan(g, orders_group, order_id=0, flag=0):
     Divisions start marching to the line. order_id=0 means the army's whole plan.
     """
     p = g.p
+    ctor = OE2_CTOR   # verified; `_order_ctor` falls back to the stale 1.19.2 one
+    try:
+        import api as _api
+        _api.allow_call(int(ctor))
+    except Exception:
+        pass
+    if not ctor:
+        return False, "COrderExecuteCommand ctor not found"
     own = g._inj is None
     if own: g.attach()
     try:
         cmd = g.malloc(OE2_SIZE); p.write(cmd, b"\0" * OE2_SIZE)
-        g.call(OE2_CTOR, [cmd, orders_group, order_id, flag, 0])
+        g.call(ctor, [cmd, orders_group, order_id, flag, 0])
+        # 2026-11-08: RUN_CMD does `mov rax,[cmd]; call [rax+0x50]` at 0x20AE17E.
+        # When the constructor never wrote the vtable, [cmd] is 0 and that is the
+        # SIGSEGV at RIP=RUN_CMD+0xDE with rax=0 that killed two runs. Refuse.
+        if not p.u64(cmd):
+            return False, ("COrderExecuteCommand ctor %#x wrote no vtable "
+                           "(wrong ctor address for this build)" % ctor)
         check_field_handle(g, cmd, 0x24, orders_group, "execute_plan/og")
         if p.i32(cmd + 0x2C) != order_id:
-            return False, "order id yazilmadi"
-        ok = g.call(OE2_CANEXE, [cmd, 0]) & 0xFF
+            return False, "order id was not written"
+        s = _mkstring(g)
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
-            return False, "CanExecute false (no plan, or it cannot be executed)"
-        g.cmd.post(cmd)
+            return False, _readstring(g, s) or "CanExecute false (no plan, or it cannot be executed)"
         return True, ""
     finally:
         if own: g.detach()
@@ -493,8 +638,9 @@ def execute_plan(g, orders_group, order_id=0, flag=0):
 #        CPdxArray<CArmy*>* divisions|0, u8, u8, u8, void*|0)
 #   +0x24 og | +0x38 division handle array | +0x50 province id array
 #   +0x68 parent order's instance_id | +0x6C/+0x6D/+0x6E flags
-NF_CTOR   = 0x21F9BF0
-NF_CANEXE = 0x21FB390
+NF_CTOR   = 0x232CC20   # VERIFIED 2026-11-08 (vtable 0x446ac90, 9 UI call sites).
+                        # The old 0x21F9BF0 was a 1.19.2 leftover.
+NF_CANEXE = 0x232E3C0   # 2026-11-08: real vtable+0x50 entry (was 0x21FB390 = 1.19.2, calling it SIGSEGVs).
 NF_SIZE   = 0x70
 
 
@@ -549,6 +695,14 @@ def offensive_line(g, orders_group, parent_order_id, provinces, divisions=None):
     from game import _arr
     if not provinces:
         return False, "target province list is empty"
+    ctor = NF_CTOR
+    try:
+        import api as _api
+        _api.allow_call(int(ctor))
+    except Exception:
+        pass
+    if not ctor:
+        return False, "COrderNewFrontCommand ctor not found"
     own = g._inj is None
     if own: g.attach()
     try:
@@ -560,18 +714,22 @@ def offensive_line(g, orders_group, parent_order_id, provinces, divisions=None):
         if parent is None:
             return False, "parent order not found: %d" % parent_order_id
         path = _mkintarray(g, provinces)
-        darr = _mkarray(g, list(divisions)) if divisions else 0
+        # 2026-11-08 (work order vtable_1108 §1.2): the ctor's 5th parameter is a
+        # C++ `const CPdxArray<CArmy*>&`, i.e. a POINTER to a valid array header.
+        # The UI call site 0x7b2e86 passes `lea [rbp-0x80]`, a size-0 array — never
+        # NULL. Passing 0 made the ctor dereference a low address and SIGSEGV.
+        darr = _mkarray(g, list(divisions) if divisions else [])
         cmd = g.malloc(NF_SIZE); p.write(cmd, b"\0" * NF_SIZE)
-        g.call(NF_CTOR, [cmd, orders_group, path, parent, darr, 0, 0, 0, 0])
+        g.call(ctor, [cmd, orders_group, path, parent, darr, 0, 0, 0, 0])
         check_field_handle(g, cmd, 0x24, orders_group, "offensive_line/og")
         if p.i32(cmd + 0x68) != parent_order_id:
             return False, "parent order id was not written (%d)" % p.i32(cmd + 0x68)
         if p.i32(cmd + 0x5C) != len(provinces):
             return False, "province path was not filled (%d/%d)" % (p.i32(cmd + 0x5C), len(provinces))
-        ok = g.call(NF_CANEXE, [cmd, 0]) & 0xFF
+        s = _mkstring(g)
+        ok = g.call(RUN_CMD, [cmd, s]) & 0xFF
         if not ok:
-            return False, "CanExecute false (not at war, or the line is not valid)"
-        g.cmd.post(cmd)
+            return False, _readstring(g, s) or "CanExecute false (not at war, or the line is not valid)"
         return True, ""
     finally:
         if own: g.detach()
@@ -579,9 +737,10 @@ def offensive_line(g, orders_group, parent_order_id, provinces, divisions=None):
 
 # ------------------------------------------------------------------ fallback line
 # COrderNewFallbackCommand(this, og, CPdxArray<i32>* province_path, CPdxArray<CArmy*>* divisions|0)
-FB_CTOR   = 0x21F22F0
-FB_CANEXE = 0x21F2A10
-FB_SIZE   = 0x70
+# V2-05: 1.19.4.1 COrderNewFallbackCommand ctor 0x23247A0, vt 0x446A330.
+FB_CTOR   = 0x23247A0
+FB_CANEXE = 0x2324EC0          # reference only
+FB_SIZE   = 0x1D8   # C3: 472 bytes in 1.19.4.1 (cmdfields.pkl). 0x70 overflowed the heap block by 360 bytes.
 
 
 def fallback_line(g, orders_group, provinces, divisions=None):
@@ -594,13 +753,16 @@ def fallback_line(g, orders_group, provinces, divisions=None):
     try:
         path = _mkintarray(g, provinces)
         darr = _mkarray(g, list(divisions)) if divisions else 0
+        import api as _api
+        _api.allow_call(FB_CTOR)
         cmd = g.malloc(FB_SIZE); p.write(cmd, b"\0" * FB_SIZE)
         g.call(FB_CTOR, [cmd, orders_group, path, darr])
+        if not p.u64(cmd):
+            return False, "COrderNewFallbackCommand ctor wrote no vtable"
         check_field_handle(g, cmd, 0x24, orders_group, "fallback_line/og")
-        ok = g.call(FB_CANEXE, [cmd, 0]) & 0xFF
-        if not ok:
-            return False, "CanExecute false"
-        g.cmd.post(cmd)
+        rv = g._run_cmd(cmd)
+        if not (rv & 0xFF):
+            return False, getattr(g, "_last_cmd_error", "") or "CanExecute false"
         return True, ""
     finally:
         if own: g.detach()
@@ -610,9 +772,15 @@ def fallback_line(g, orders_group, provinces, divisions=None):
 # NOTE: the field meanings of these two commands could not be tested in a war (the
 # game was at peace). For safety they are only sent if the game's own CanExecute agrees
 # and `confirm=True` is required.
-INV_CTOR = 0x2200160; INV_CANEXE = 0x2200760; INV_SIZE = 0x60
-PD_CTOR  = 0x2202420; PD_CANEXE  = 0x22029F0; PD_SIZE  = 0x60
-PDT_CTOR = 0x2202EE0; PDT_CANEXE = 0x22030F0; PDT_SIZE = 0x40
+# V2-05 (verified): 1.19.4.1 addresses straight out of cmdctors.pkl.
+# NOTE the "corrections" in the V2 work order (0x2333940 / 0x23360C0 / 0x2336C80)
+# are all exactly +0x40 off and land in the MIDDLE of the function — objdump shows
+# 0x2333900/0x2336080/0x2336C40 are the real `push rbp; mov rbp,rsp` prologues.
+INV_CTOR = 0x2333900; INV_CANEXE = 0x2333C40; INV_SIZE  = 0x1D8   # COrderSetInvasionSourceCommand
+PD_CTOR  = 0x2336080; PD_CANEXE  = 0x23363C0; PD_SIZE   = 0x1D8   # COrderSetParadropSourceCommand
+PDT_CTOR = 0x2336C40; PDT_CANEXE = 0x2336F80; PDT_SIZE = 0x38     # COrderSetParadropTargetCommand
+GET_ORDER   = 0x2346C40   # COrdersGroup::GetOrder(i32 id) -> COrderInstance*
+PRED_TARGET = 0x22EEFE0   # COrderInstance::CanSetProvinceTarget(order, CProvince*)
 
 
 def naval_invasion(g, orders_group, order_id, source_province, target_province,
@@ -644,31 +812,271 @@ def naval_invasion(g, orders_group, order_id, source_province, target_province,
         if own: g.detach()
 
 
-def paradrop(g, orders_group, order_id, source_province, target_province,
-             divisions=None, confirm=False):
-    """Paradrop order (kind 4).
+def paradrop(g, orders_group, source_province, target_province,
+             divisions=None, order_id=0, confirm=False, wait=8.0):
+    """Build a PARADROP order (COrderInstance kind 4) with the game's own commands.
 
-    Constructor signature: (this, og, i32, i32, CPdxArray<CArmy*>*)
-    The meaning of the integers is untested; CanExecute plus confirm is required.
+    Read out of 1.19.4.1 and then measured live (2026-11-10):
+
+      COrderSetParadropSourceCommand   vtable 0x446B780  ctor 0x2336080
+        CanExecute 0x23365E0   Execute 0x2336390
+        (this, COrdersGroup*, i32 province_id, i32 order_id, CPdxArray* divisions)
+          +0x24 og handle | +0x2c order_id | +0x30 province_id | +0x38 division array
+        CanExecute: GetProvince(+0x30) != NULL && 0x22EED60(og, province)
+        Execute:    og = ResolveHandle(+0x24)
+                    order = CreateOrder(og, 4) when +0x2c == 0, else FindOrderById(og, +0x2c)
+                    order->+0xB8 = +0x30                    # source province
+                    if order->+0x7C == 0: return            # no target yet -> stops here
+                    when +0x44 > 0: posts COrderAssignCommand with the array
+
+      COrderSetParadropTargetCommand   vtable 0x446B848  ctor 0x2336C40
+        CanExecute 0x2336E50   Execute 0x2336D20
+        (this, COrdersGroup*, i32 order_id, i32 province_id)
+          +0x2c order_id | +0x30 province_id
+        Execute: order = FindOrderById(og, +0x2c); targets[0] = +0x30; count = 1
+        CanExecute ends in 0x22EEFE0(order, province): land province, not the source,
+        and inside paradrop range of a transport wing.
+
+    Two things that cost a whole evening and are therefore written down:
+
+      1. `CCommand::Run` (0x20AE0A0) only *queues* the command. The order shows up on
+         the game's next tick, and the injector freezes every game thread while it is
+         attached, so the wait loop must run with the process detached.
+      2. order_id != 0 is refused by CanExecute; the game's own UI call site passes 0
+         (`xor ecx,ecx` at 0x80a269). Every call therefore creates a new type-4 order
+         and the engine never merges them.
+
+      3. 2026-11-10, after nine rounds of "0 hits": every target province was
+         refused because the ORDER'S SOURCE PROVINCE must be a province whose air
+         base actually hosts the transport wing.  CanExecute ends in
+             0x23DF580(CAirBase(GetProvince(order->0xB8)), 0x100000,
+                       &ordersGroup->0x3C, targetProvince)
+         and 0x23DF580 walks CAirBase+0x30[countryIndex] (a CCountryAirContainer,
+         wings at +0xB8/+0xC4) keeping the biggest range among the wings whose
+         definition carries the 0x100000 capability bit (transport planes).  No
+         transport wing in that base -> range 0 -> the target is refused no matter
+         which province it is.  The old sweeps set the source to 11500/6521/64/908,
+         none of which is the transport base (519 here), so 0 of 1291 land provinces
+         passed.  With the source at 519, 109 provinces pass immediately.
+         airops.paradrop_source_provinces() / source_has_transport() now resolve and
+         verify that, and paradrop() refuses a source without transport planes.
     """
+    import time
     p = g.p
     own = g._inj is None
-    if own: g.attach()
+    from game import _arr as _garr
+
+    def ids():
+        if own:
+            g.attach()
+        try:
+            return {p.i32(o + 0x244) for o in _garr(p, orders_group, OG_ORDERS)}
+        finally:
+            if own:
+                g.detach()
+
+    import api as _api
+    import airops as _airops
+    _api.allow_call(PD_CTOR)
+    _api.allow_call(PDT_CTOR)
+
+    # A paradrop source is only legal when that province's air base hosts a
+    # transport-capable wing of this country: COrderInstance::CanSetProvinceTarget
+    # (0x22EEFE0) asks 0x23DF580(CAirBase, 0x100000, &ordersGroup->0x3C, target)
+    # and rejects the target when that returns 0.  Resolve or verify it here so
+    # the caller does not have to know which air base the transports sit in.
+    src_note = ""
+    if own:
+        g.attach()
     try:
-        darr = _mkarray(g, list(divisions) if divisions else [])
-        cmd = g.malloc(PD_SIZE); p.write(cmd, b"\0" * PD_SIZE)
-        g.call(PD_CTOR, [cmd, orders_group, int(order_id), int(source_province), darr])
-        check_field_handle(g, cmd, 0x24, orders_group, "paradrop/og")
-        ok = g.call(PD_CANEXE, [cmd, 0]) & 0xFF
-        if not ok:
-            return False, "the game refused (needs paratroopers, range, and air superiority)"
-        if not confirm:
-            return False, "looks applicable, but this command has never been tested; pass confirm=true"
-        g.cmd.post(cmd)
-        cmd2 = g.malloc(PDT_SIZE); p.write(cmd2, b"\0" * PDT_SIZE)
-        g.call(PDT_CTOR, [cmd2, orders_group, int(target_province), int(order_id)])  # (this, og, i32, i32)
-        if g.call(PDT_CANEXE, [cmd2, 0]) & 0xFF:
-            g.cmd.post(cmd2)
-        return True, ""
+        if source_province is None:
+            cands = _airops.paradrop_source_provinces(g, orders_group)
+            if not cands:
+                return False, ("no transport-plane wing of this country is stationed in any "
+                               "air base; a paradrop needs one")
+            source_province = cands[0]["province"]
+            src_note = " (auto: transport wing based in this province)"
+        else:
+            wings = _airops.source_has_transport(g, orders_group, int(source_province))
+            if not wings:
+                cands = _airops.paradrop_source_provinces(g, orders_group)
+                return False, ("province %d cannot start a paradrop: its air base holds no "
+                               "transport wing of this country. Use one of %s"
+                               % (int(source_province),
+                                  [c["province"] for c in cands] or "none"))
     finally:
-        if own: g.detach()
+        if own:
+            g.detach()
+
+    oid = int(order_id or 0)
+    if oid:
+        # Reuse an existing type-4 order.  COrderSetParadropSourceCommand::CanExecute
+        # refuses order_id != 0, so write the source province into the order exactly
+        # like that command's Execute does (order->+0xB8) and go straight to the target.
+        if own:
+            g.attach()
+        try:
+            _api.allow_call(GET_ORDER)
+            op = g.call(GET_ORDER, [orders_group, oid]) & 0xFFFFFFFFFFFFFFFF
+            if not op:
+                return False, "order %d does not exist in this army" % oid
+            p.write(op + 0xB8, struct.pack("<i", int(source_province)))
+        finally:
+            if own:
+                g.detach()
+    else:
+        before = ids()
+        if own:
+            g.attach()
+        try:
+            cmd = g.malloc(PD_SIZE)
+            p.write(cmd, b"\0" * PD_SIZE)
+            g.call(PD_CTOR, [cmd, orders_group, int(source_province), 0, 0])
+            if not p.u64(cmd):
+                return False, "COrderSetParadropSourceCommand ctor wrote no vtable"
+            # Divisions travel inside the source command (+0x38 CPdxArray<handle>), like
+            # the UI's selection does; Execute then posts COrderAssignCommand for the
+            # freshly created order.
+            if divisions:
+                data = g.malloc(max(1, len(divisions)) * 8)
+                p.write(data, b"".join(p.read(int(d) + CARMY_HANDLE, 8) for d in divisions))
+                p.write(cmd + 0x38, struct.pack("<Qii", data, len(divisions), len(divisions)))
+            check_field_handle(g, cmd, 0x24, orders_group, "paradrop/og")
+            rv = g._run_cmd(cmd)
+        finally:
+            if own:
+                g.detach()
+        if not (rv & 0xFF):
+            return False, (getattr(g, "_last_cmd_error", "")
+                           or "the game refused the paradrop source")
+        deadline = time.time() + wait
+        while not oid:
+            new = ids() - before
+            if new:
+                oid = max(new)
+                break
+            if time.time() > deadline:
+                return False, ("the source command was queued but no order appeared within "
+                               "%.1fs (is the game paused?)" % wait)
+            time.sleep(0.25)
+
+    # Ask the engine's own predicate before posting the target command: it is the
+    # same 0x22EEFE0 the command's CanExecute uses, so a failure here is exact.
+    if own:
+        g.attach()
+    try:
+        _api.allow_call(GET_ORDER)
+        order_ptr = g.call(GET_ORDER, [orders_group, int(oid)]) & 0xFFFFFFFFFFFFFFFF
+    finally:
+        if own:
+            g.detach()
+    if not order_ptr:
+        return False, "order %d disappeared from the army before the target was set" % oid
+
+    if own:
+        g.attach()
+    try:
+        _api.allow_call(PRED_TARGET)
+        tptr = g.province_ptr(int(target_province))
+        ok_pred = bool(tptr) and bool(g.call(PRED_TARGET, [order_ptr, tptr]) & 0xFF)
+    finally:
+        if own:
+            g.detach()
+    if not ok_pred:
+        return False, ("province %d is refused as a paradrop target from province %d: it must "
+                       "be a land province other than the source and inside the transport "
+                       "wing's range (use hoi4_paradrop_targets for the legal list)"
+                       % (int(target_province), int(source_province)))
+
+    if not confirm:
+        return False, ("source %d accepted%s on order %d; pass confirm=true to set the "
+                       "target" % (int(source_province), src_note, oid))
+
+    if own:
+        g.attach()
+    try:
+        cmd2 = g.malloc(PDT_SIZE)
+        p.write(cmd2, b"\0" * PDT_SIZE)
+        g.call(PDT_CTOR, [cmd2, orders_group, int(oid), int(target_province)])
+        if not p.u64(cmd2):
+            return False, "COrderSetParadropTargetCommand ctor wrote no vtable"
+        rv2 = g._run_cmd(cmd2)
+    finally:
+        if own:
+            g.detach()
+    if not (rv2 & 0xFF):
+        return False, (getattr(g, "_last_cmd_error", "")
+                       or ("the game refused province %d as a paradrop target for order "
+                           "%d (0x22EEFE0: land, not the source, and inside paradrop "
+                           "range of a transport wing)"
+                           % (int(target_province), oid)))
+
+    if divisions:
+        if own:
+            g.attach()
+        try:
+            _api.allow_call(GET_ORDER)
+            op = g.call(GET_ORDER, [orders_group, int(oid)]) & 0xFFFFFFFFFFFFFFFF
+            have = p.i32(op + 0x21C) if op else 0
+        finally:
+            if own:
+                g.detach()
+        if not have:
+            ok, err = assign_to_order(g, orders_group, oid, list(divisions))
+            if not ok:
+                return False, "target accepted but the divisions were refused: %s" % err
+    return True, ""
+
+
+
+def paradrop_targets(g, orders_group, source_province=None, limit=2000):
+    """Every province id the engine accepts as a paradrop target from this army.
+
+    Uses COrderInstance::CanSetProvinceTarget (0x22EEFE0) directly, so the answer
+    is exactly what COrderSetParadropTargetCommand::CanExecute would decide.  The
+    source province is written into an existing type-4 order for the duration of
+    the sweep and restored afterwards (the predicate reads it from the order).
+    """
+    import api as _api
+    import airops as _airops
+    from game import _arr as _garr
+    p = g.p
+    own = g._inj is None
+    if own:
+        g.attach()
+    try:
+        _api.allow_call(PRED_TARGET)
+        if source_province is None:
+            cands = _airops.paradrop_source_provinces(g, orders_group)
+            if not cands:
+                return []
+            source_province = cands[0]["province"]
+        orders = [o for o in _garr(p, orders_group, OG_ORDERS) if p.i32(o + 0x30) == 4]
+        if not orders:
+            return []
+        order = orders[0]
+        old = p.i32(order + 0xB8)
+        p.write(order + 0xB8, struct.pack("<i", int(source_province)))
+        out = []
+        try:
+            for pid in range(1, limit):
+                try:
+                    pr = g.province_ptr(pid)
+                except Exception:
+                    continue
+                if not pr:
+                    continue
+                d8 = p.u64(pr + 0xD8)
+                if not d8 or not (p.u8(d8 + 0xD2) & 1):
+                    continue
+                try:
+                    if g.call(PRED_TARGET, [order, pr]) & 0xFF:
+                        out.append(pid)
+                except Exception:
+                    pass
+        finally:
+            p.write(order + 0xB8, struct.pack("<i", old))
+        return out
+    finally:
+        if own:
+            g.detach()

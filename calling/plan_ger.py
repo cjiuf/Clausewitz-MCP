@@ -39,15 +39,13 @@ RESEARCH_ORDER = [
     "excavation1", "excavation2", "excavation3",
     "fuel_silos", "synth_oil_experiments", "oil_processing",
     # infantry and support
-    "infantry_weapons2", "support_weapons", "infantry_weapons3",
+    "infantry_weapons2", "support_weapons", "improved_infantry_weapons",
     "interwar_antiair", "interwar_artillery", "artillery1", "motorised_infantry",
     # armour: the medium tank line
     "basic_medium_tank", "improved_medium_tank", "basic_light_tank_chassis",
     # air: do not PRODUCE 1936 planes, research the 1940 line
     "fighter2", "CAS2", "fighter3", "heavy_fighter2",
     "engines_2", "engines_3",
-    # doctrine
-    "mobile_warfare", "trench_warfare", "combined_arms",
 ]
 
 # ---------------------------------------------------------------- construction

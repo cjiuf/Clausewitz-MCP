@@ -5,12 +5,12 @@ All values are ELF virtual addresses relative to the image base; at runtime, bas
 Verified against the game's own UI; see research/FINDINGS.md.
 """
 
-VERSION = "1.19.2"
+VERSION = "1.19.4.1"
 BUILD_ID = "2a79e51358b8b71c09cfb5ddefa0c03649067a4b"
 
 # ---------------------------------------------------------------- global'ler
-G_GAMESTATE        = 0x43F2648   # CGameState* (root of the game state)
-G_COUNTRYTAG_DB    = 0x43DDE68   # CCountryTagDatabase*, the tag string table
+G_GAMESTATE        = 0x459E9F0
+G_COUNTRYTAG_DB    = 0x458A088
 G_MODIFIER_DEFS    = 0x4388AC8   # SModifierDef[] (stride 0x78), named modifier definitions
 G_CONSOLE_MANAGER  = 0x4652018   # CConsoleCmdManager*
 G_DEFAULT_ALLOC    = 0x43591B8   # IPdxAllocator* (default for CPdxArray)
@@ -28,7 +28,13 @@ CO_NAME            = 0x10    # std::string - country name ("German Reich")
 CO_ADJECTIVE       = 0x30    # std::string, adjective     ("German")
 CO_STATES          = 0x460   # CPdxArray<CState*>   (data@+0x460, size@+0x46c)
 CO_MODIFIERS       = 0x5B0   # modifier container (CPdxArray<{int32 id; int64 val}>)
-CO_MANPOWER_SUB    = 0x328   # GetManpower(this+0x328)
+CO_MANPOWER_SUB    = 0x328   # 1.19.4: CCountryManpower INLINE subobject (not a pointer).
+                             # Disassembly 2026-11-12: console `manpower` (0x1C4AC20)
+                             # does `lea rax,[rax+0x328]` then calls 0x21DA4B0, which
+                             # updates +0x0C (pool path, the one the console uses) and
+                             # +0x18 (direct add/sub path). Which one the top bar shows
+                             # still needs one live comparison.
+CO_MANPOWER_CUR    = 0x23F0  # 1.19.4: int64 当前可用人力（与顶栏一致，仅玩家国可靠）
 CO_ECONOMY         = 0xF40   # CCountryEconomy*
 CO_POLITICS        = 0xF68   # CCountryPolitics*
 CO_STABILITY_BASE  = 0x10A8  # int64 fixed(1e5)
@@ -37,12 +43,18 @@ CO_NUKES           = 0x12D8  # obj -> +0x18 int64
 CO_FUEL            = 0x1520  # obj -> +0x08 int64
 CO_TAG_ID          = None    # the tag is not stored directly; resolved via tag2index
 
+# CNationalFocusProgress (CCountry+0x1348), 1.19.4.1
+# The completed array is NO LONGER at CCountry+0x1C10 (that is 0x100000001 garbage).
+FP_CURRENT         = 0x10    # CNationalFocus*
+FP_COMPLETED       = 0x40    # CPdxArray<CNationalFocus*>
+FP_ROOT_FOCUSES    = 0x70    # CPdxArray<CNationalFocus*>, tree roots (not "selectable")
+
 # -------------------------------------------------------- CCountryEconomy
-EC_MIL_FACTORIES   = 0x2B8   # int64 fixed(1e5), military factories
-EC_NAVAL_DOCKYARDS = 0x318   # int64 fixed(1e5), dockyards
-EC_CIV_FACTORIES   = 0x378   # int64 fixed(1e5), civilian factories (gross)
-EC_CIV_RESERVED_A  = 0x3B8   # int32, deducted from the civilian count
-EC_CIV_RESERVED_B  = 0x3C0   # int32, deducted from the civilian count
+EC_MIL_FACTORIES   = 0x2D0
+EC_NAVAL_DOCKYARDS = 0x330
+EC_CIV_FACTORIES   = 0x390
+EC_CIV_RESERVED_A  = 0x3D0
+EC_CIV_RESERVED_B  = 0x3D8
 
 # ------------------------------------------------------- CCountryPolitics
 PO_POLITICAL_POWER = 0xE0    # int64 fixed(1e5)
@@ -60,8 +72,8 @@ FN_GET_WAR_SUPPORT = 0xD378D0   # int64 CCountry::GetWarSupport(CCountry*, void*
 FN_GET_MANPOWER    = 0x20B36E0  # int64 GetManpower(CCountry* + 0x328)
 FN_GET_COUNTRY_NAME= 0xD78310   # std::string* GetCountryName(CCountryTag*)  == country+0x10
 FN_GET_MODIFIER    = 0x2111840  # int64 GetModifier(container, int32 modifierId)
-FN_OPERATOR_NEW    = 0x3485810  # void* operator new(size_t)
-FN_OPERATOR_DELETE = 0x3485850  # void  operator delete(void*)
+FN_OPERATOR_NEW    = 0x510950  # void* operator new(size_t)
+FN_OPERATOR_DELETE = 0x510260  # void  operator delete(void*)
 
 # --------------------------------------------------------------- structures
 # CPdxArray<T,int> { T* data; int32 capacity; int32 size; IAllocator* alloc; }  = 0x18

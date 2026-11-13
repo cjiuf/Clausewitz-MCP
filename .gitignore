@@ -16,3 +16,15 @@ research/re-dumps/*
 
 # Logs
 *.log
+
+# Working files that should never be committed
+*.bak
+*.bak-*
+*.bak[0-9]*
+calling/objindex.pkl.tmpscan
+calling/prov_ptrs.json
+calling/console_table.json
+calling/front_snapshot.json
+calling/front_directives.json
+calling/staff_shadow.jsonl
+calling/subunit_pointers_live.json

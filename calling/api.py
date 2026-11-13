@@ -110,13 +110,22 @@ class Country:
 
     # ---- by calling the game's own functions (exact values) ----
     def stability(self) -> float:
-        return self.game.call(O.FN_GET_STABILITY, (self.ptr, 0), signed=True) / O.FIXED
+        # 1.19.4: 引擎函数地址不可用，退回基础值（不含修正）
+        return self.stability_base
 
     def war_support(self) -> float:
-        return self.game.call(O.FN_GET_WAR_SUPPORT, (self.ptr, 0), signed=True) / O.FIXED
+        return self.war_support_base
 
-    def manpower(self) -> int:
-        return self.game.call(O.FN_GET_MANPOWER, (self.ptr + O.CO_MANPOWER_SUB,), signed=True)
+    def manpower(self):
+        # 1.19.4: 直读字段（引擎函数地址已失效）
+        # +0x23F0 only behaves for the country whose UI is being drawn. On an AI
+        # country the same slot can hold a heap pointer (measured HOL:
+        # 0x5bf3df000000 = 1.01e14) which staff_army turned into a ten-billion
+        # division manpower cap. Refuse anything that cannot be manpower.
+        v = self.game.p.i64(self.ptr + O.CO_MANPOWER_CUR)
+        if -1 <= v <= 500_000_000:
+            return int(v)
+        return None
 
     # ---- identity ----
     @property
@@ -203,28 +212,22 @@ class Country:
 # functions whose signature has been recovered statically may be called. Anything new
 # gets disassembled first, then added here.
 VERIFIED_CALLS = {
-    0x2095400, 0x20955A0,  # CPauseGame ctor(this,std::string*,u8,u8) / CanExecute
-    0x2D82F10,  # Resolve(handle*) -> obj
-    0x3471B20,  # token id -> std::string*
-    0x3485810,  # operator new
-    0x3485830, 0x3485850,  # operator delete
-    0x344B060, 0x344B080,  # console
-    0xD77A90, 0xD36470, 0xD378D0, 0x20B36E0, 0x2111840, 0x11CBF10,
-    0x2DC1C40,  # CommandQueue::Post
-    # armies and battle plans
-    0x21E4710, 0x21E4FC0, 0x21E5910, 0x21E66F0, 0x21FF3E0, 0x21FF820,
-    0x21F3A10, 0x21F4280, 0x21F9BF0, 0x21FB390, 0x21F22F0, 0x21F2A10,
-    0x21EBA90, 0x21ED460, 0x21E9530, 0x21E9090, 0x21FEE60, 0x21FF200,
-    0x2200160, 0x2200760, 0x2202420, 0x22029F0, 0x2202EE0, 0x22030F0,
-    # diplomacy
-    0xA563A0, 0xA435D0, 0xA45AA0, 0xA4FBB0,
-    # per-division orders (right click): ONLY the constructor is safe.
-    # 0x23E9A70, mistaken for "CanExecute", jumps to 0x23E8310: a 140-line
-    # a routine that touches game state and checks _ThreadForbidCount.
-    # Calling it in a live game FROZE it. Never call it.
-    0x23E9950, 0x21EDB90, 0x21EE620,
-    # read side
-    0xD1FE30, 0x2D8EE60, 0x2D84A70,
+    # ---- only addresses re-derived for 1.19.4.1 (build f54d) ----
+    0x510950,   # operator new(size_t)                      _Znwm@plt
+    0x510260,   # operator delete(void*)                    _ZdlPv@plt
+    0x2F212D0,  # CCommandQueue::Post(queue, cmd, force)
+    0x20AE0A0,  # CCommand::Run(cmd, std::string* err)
+    0x21928A0,  # CInGameIdler::GetCommandQueue()
+    0x2046880,  # app->vt[0x90]: returns *(app+0x380) == queue
+    0x23151C0,  # COrderGroupCommand ctor
+    0x23167D0,  # CArmyGroupCommand ctor
+    0x2332940,  # CSetArmyLeaderCommand ctor
+    0x2325E10,  # COrderNewRootCommand ctor (front line: DISABLED)
+    0x253A600,  # CMoveCommand ctor (route A)
+    0x1CF6ED0,  # CSetNationalFocusCommand ctor (base-init reference)
+    # 0xA4FB80 / 0xA563A0 were here: they are 1.19.2 addresses. In 1.19.4.1 they land
+    # in the middle of unrelated functions and every call faulted (sig=11, rip on the
+    # stack). Removed 2026-11-04; the diplomatic ctors are looked up in diploactions.pkl.
 }
 
 
@@ -241,7 +244,7 @@ _mp_cache = [None, 0.0]
 #   CCommandQueue::Post  -> queues the command (the player's normal path)
 # These were not what caused the freeze; calling a routine that TOUCHES GAME
 # STATE was.
-MP_SAFE_CALLS = {0x3485810, 0x3485830, 0x3485850, 0x23E9950, 0x2DC1C40}
+MP_SAFE_CALLS = {0x510950, 0x510260, 0x2F212D0, 0x20AE0A0, 0x253A600}
 
 
 def multiplayer_detected(game, ttl=30.0):
@@ -261,23 +264,40 @@ _stats_loaded = False
 
 
 def _load_stat_calls():
-    """Country trigger getters found by stats.py through static analysis (known
-    single-argument scope) are added to the verified list."""
+    """DISABLED 2026-11-04.
+
+    `stats.pkl` was scanned on 2026-10-29 against the 1.19.2 build, so it holds 45
+    trigger-function addresses that do not exist in 1.19.4.1. Whitelisting them let
+    `g.wars() -> country_stats()` ptrace-call 45 wild addresses and smash the game
+    stack (hoi4_wars killed the process within 10 s, every time).
+
+    Do NOT re-enable until `research/stats.py` has been re-run against this binary
+    and every recovered signature re-verified. Pure memory reads are unaffected.
+    """
     global _stats_loaded
-    if _stats_loaded:
-        return
     _stats_loaded = True
-    try:
-        import stats as _st
-        for _fn, _cls in _st.build().values():
-            VERIFIED_CALLS.add(_fn)
-    except Exception:
-        pass
+    return
+
+
+# Country-scope getters (f(this, scope) -> int64) that have been re-derived from
+# THIS 1.19.4.1 binary and re-verified. Empty on purpose: the old `stats.pkl`
+# table is a 1.19.2 artefact and calling any of its 45 addresses smashes the game
+# stack. `Game._scope_call` refuses everything that is not listed here.
+SCOPE_CALL_ALLOW = set()
 
 
 def allow_call(addr):
-    """Add a function to the verified-call list, once you are sure of its signature."""
+    """Add a function to the verified-call list, once you are sure of its signature.
+
+    The low-level Injector keeps its own whitelist (it sees absolute addresses), so
+    every registration has to reach both layers.
+    """
     VERIFIED_CALLS.add(addr)
+    try:
+        from process import backend as _be
+        _be.allow_call(addr)
+    except Exception:
+        pass
 
 
 class HOI4:
@@ -291,6 +311,8 @@ class HOI4:
         self._moddefs = None
         self._date_addr = None
         self._cmds = None
+        self._dead_date_addrs = set()
+        self._dead_date_pid = None
 
     # =============================================== core globals
     @property
@@ -313,17 +335,49 @@ class HOI4:
         self.detach()
 
     def attach(self):
-        """Attach once when making several calls; much faster than attaching per call."""
+        """Attach once when making several calls; much faster than attaching per call.
+
+        2026-11-08 (run 20): every process that injects now takes an exclusive
+        `flock` on /tmp/hoi4_ptrace.lock first. The gateway runs a front_worker
+        thread that calls `hoi4_tactical_front_tick` every 8 s, and the model (or a
+        stage/ script) can attach at the same moment: two PTRACE_SEIZE +
+        register rewrites on the same main thread garble RIP/RSP and kill the
+        process. The kernel serialises them instead.
+        """
         if self._depth == 0:
-            self._inj = Injector(self.p)
-            self._inj.attach()
+            import fcntl
+            self._lock_fh = open("/tmp/hoi4_ptrace.lock", "w")
+            fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                self._inj = Injector(self.p)
+                self._inj.attach()
+            except Exception:
+                try:
+                    fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+                    self._lock_fh.close()
+                except Exception:
+                    pass
+                self._lock_fh = None
+                raise
         self._depth += 1
         return self
 
     def detach(self):
         self._depth = max(0, self._depth - 1)
-        if self._depth == 0 and self._inj:
-            self._inj.detach(); self._inj = None
+        if self._depth == 0:
+            try:
+                if self._inj:
+                    self._inj.detach(); self._inj = None
+            finally:
+                fh = getattr(self, "_lock_fh", None)
+                if fh is not None:
+                    try:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                        fh.close()
+                    except Exception:
+                        pass
+                    self._lock_fh = None
 
     def call(self, func_vaddr: int, args: Iterable[int] = (), signed=False,
              scratch_writer=None, absolute=False, force=False):
@@ -376,78 +430,62 @@ class HOI4:
         return self.console_argv(argv)
 
     def console_argv(self, argv) -> ConsoleResult:
-        mgr = self.p.u64(self.va(O.G_CONSOLE_MANAGER))
-        if not mgr:
-            raise RuntimeError("console manager not found")
-        alloc = self.va(O.G_DEFAULT_ALLOC)
-        holder = {}
-        # allocate real heap in the target for arguments longer than 15 characters
-        # (the std::string destructor may call operator delete, so no stack address)
-        bufs = {}
-        for i, s_ in enumerate(argv):
-            b = s_.encode("utf-8")
-            if len(b) > 15:
-                ptr = self.malloc(len(b) + 1)
-                self.p.write(ptr, b + b"\0")
-                bufs[i] = (ptr, len(b))
+        """Run a console command.
 
-        def writer(scr):
-            holder["scr"] = scr
-            out, arr, data = scr, scr + 0x100, scr + 0x200
-            blob = b""
-            for i, s2 in enumerate(argv):
-                b = s2.encode("utf-8")
-                if i in bufs:
-                    ptr, n = bufs[i]
-                    blob += struct.pack("<QQ", ptr, n) + b"\0" * 16
-                else:
-                    blob += struct.pack("<QQ", data + i * 32 + 16, len(b)) + b + b"\0" * (16 - len(b))
-            self.p.write(data, blob)
-            self.p.write(arr, struct.pack("<QiiQ", data, len(argv), len(argv), alloc))
-            self.p.write(out, b"\0" * O.SRESULT_SZ)
-            return (out, mgr, arr)
+        Two paths, in this order:
 
-        self.call(O.FN_CONSOLE_EXECUTE, scratch_writer=writer)
-        scr = holder["scr"]
-        ok = self.p.u8(scr)
-        ptr, n = struct.unpack("<QQ", self.p.read(scr + 8, 16))
-        msg = ""
-        if n and ptr:
-            msg = self.p.read(ptr, min(n, 8192)).decode("utf-8", "replace")
-        return ConsoleResult(ok, msg, " ".join(argv))
+          1. `consolecmd.run` -- look the command up in the engine's own 370-entry
+             command table and call its handler directly. No keyboard, no window
+             manager, no X server, and it keeps working after a save reload.
+          2. `xconsole.run`  -- the old typing path, kept as a fallback in case
+             the table cannot be located (it needs matchbox + a focused window).
+        """
+        cmd = " ".join(str(a) for a in argv)
+        try:
+            import consolecmd
+            ok, msg = consolecmd.run(self, cmd)
+            return ConsoleResult(ok, msg, cmd)
+        except Exception as e:
+            direct_err = repr(e)[:200]
+        try:
+            import xconsole
+            depth = getattr(self, "_depth", 0)
+            for _ in range(depth):
+                self.detach()
+            try:
+                info = xconsole.run(cmd)
+            finally:
+                for _ in range(depth):
+                    self.attach()
+            ok = bool(info.get("ok"))
+            return ConsoleResult(ok, "" if ok else (info.get("note") or "typing failed")
+                                 + " / direct: " + direct_err, cmd)
+        except Exception as e:
+            return ConsoleResult(False, "direct: %s / typing: %r" % (direct_err, e), cmd)
 
     # =============================================== console command catalogue
     def command_catalog(self) -> dict:
-        """Read the console command table from memory: {name: {aliases, func}}"""
+        """{name: {func, entry}} straight from the engine's console command table.
+
+        2026-11-10: the old version dereferenced `G_CONSOLE_MANAGER = 0x4652018`,
+        which in 1.19.4.1 points at float constants (0x3F800000C2B40000 = 1.0f /
+        -90.0f), so it always raised OSError and `hoi4_debug_list_commands` never
+        worked. The table is now found by scanning for its own first entry.
+        """
         if self._cmds is not None:
             return self._cmds
-        mgr = self.p.u64(self.va(O.G_CONSOLE_MANAGER))
-        data = self.p.u64(mgr + O.PDXARRAY_DATA)
-        n = self.p.i32(mgr + O.PDXARRAY_SIZE)
-        out = {}
-        RO_LO, RO_HI = self.va(0x34F4000), self.va(0x3962CBC)
-        for i in range(n):
-            e = data + i * O.CMD_STRIDE
-            name = self.p.stdstring(e + O.CMD_NAME)
-            if not name:
-                continue
-            na = self.p.u64(e + O.CMD_ALIAS_COUNT)
-            aliases = []
-            if 0 < na <= 3:
-                for k in range(na):
-                    ap = self.p.u64(e + O.CMD_ALIASES + k * 8)
-                    if RO_LO <= ap < RO_HI:
-                        s = self.p.cstr(ap, 64)
-                        if s:
-                            aliases.append(s)
-            fn = self.p.u64(e + O.CMD_FUNC)
-            out[name] = {"aliases": aliases, "func": "img+%#x" % (fn - self.base) if fn else None}
-        self._cmds = out
-        return out
+        import consolecmd
+        self._cmds = consolecmd.commands(self)
+        return self._cmds
 
     # =============================================== countries
     def _load_tags(self):
-        if self._tags is not None:
+        # 2026-11-06: the cache was permanent. After a save reload (new game PID,
+        # re-ordered tag2index) `country("GER")` kept returning the OLD process's
+        # CCountry pointer: research_slots read 0, country_stats returned {} and
+        # 4 research slots sat empty for the rest of the run. Key the cache on PID.
+        key = getattr(self, "_tags_pid", None)
+        if self._tags is not None and key == self.p.pid:
             return
         gs = self.gamestate
         n = self.p.i32(gs + O.GS_TAG2INDEX + O.PDXARRAY_SIZE)
@@ -462,6 +500,17 @@ class HOI4:
                       if i < n_db else None for i in range(n)]
         tmap = self.p.u64(gs + O.GS_TAG2INDEX + O.PDXARRAY_DATA)
         self._tag2idx = struct.unpack("<%di" % n, self.p.read(tmap, 4 * n))
+        self._tags_pid = self.p.pid
+
+    def _live_country_idx(self, tid: int) -> int:
+        """tag2index[tid] read live (4 bytes) so an annexation/reload never uses a
+        stale row of the cached tuple."""
+        gs = self.gamestate
+        n = self.p.i32(gs + O.GS_TAG2INDEX + O.PDXARRAY_SIZE)
+        if not (0 <= int(tid) < n):
+            return -1
+        tmap = self.p.u64(gs + O.GS_TAG2INDEX + O.PDXARRAY_DATA)
+        return self.p.i32(tmap + 4 * int(tid))
 
     def country_ptrs(self):
         gs = self.gamestate
@@ -477,10 +526,24 @@ class HOI4:
         self._load_tags()
         tag = tag.upper()
         if tag not in self._tags:
+            self._tags = None
+            self._load_tags()
+        if tag not in self._tags:
             raise KeyError("bilinmeyen tag: %s" % tag)
         tid = self._tags.index(tag)
-        ptr = self.country_ptrs()[self._tag2idx[tid]]
-        return Country(self, tag, tid, ptr)
+        ptrs = self.country_ptrs()
+        # 2026-11-06: use the cached tag2index VALUE. The live read was tried for a
+        # few hours and returned a wrong row for GER once the countries array had
+        # been reallocated by an annexation (divisions("GER") == 0 while the UI
+        # showed 106). The cached value is a snapshot of the array's CONTENT, which
+        # stays valid when the array itself is reallocated; the pid-keyed reload of
+        # _load_tags above covers a game restart.
+        ci = self._tag2idx[tid]
+        if not (0 <= ci < len(ptrs)):
+            self._tags = None
+            self._load_tags()
+            ci = self._tag2idx[tid]
+        return Country(self, tag, tid, ptrs[ci])
 
     def countries(self):
         self._load_tags()
@@ -614,90 +677,449 @@ class HOI4:
         return struct.unpack_from("<q", raw, lo * 16 + 8)[0]
 
     # =============================================== date
-    def find_date_address(self, force=False) -> int:
-        """Locate the game date in memory. Done once per session, then cached.
+    def _scan_logs_date(self):
+        """Latest [YYYY.MM.DD.hh] stamp found in the game's log files."""
+        import re, glob as _glob
+        best = None
+        d = None
+        try:
+            d = os.path.join(os.path.dirname(self.p.path), "..", "logs")
+        except Exception:
+            d = None
+        cands = []
+        for pat in ("game.log", "error.log"):
+            for root in (os.path.expanduser(
+                    "~/.local/share/Paradox Interactive/Hearts of Iron IV/logs"),):
+                cands.append(os.path.join(root, pat))
+        for f in cands:
+            try:
+                txt = open(f, errors="ignore").read()[-200000:]
+            except Exception:
+                continue
+            for m in re.finditer(r"\[(\d{4})\.(\d{2})\.(\d{2})\.(\d{2})\]", txt):
+                y, mo, dd, hh = map(int, m.groups())
+                v = (y * 365 + (mo - 1) * 30 + dd) * 24 + hh
+                if best is None or v > best:
+                    best = v
+        return best
 
-        1) Scan every int32 in the valid Clausewitz date range with numpy.
-        2) Look first for the 1/24 float signature (the game clock object).
-        3) Failing that, pick the candidate that increments slowly as the game runs.
-        4) Failing that, the candidate closest to the last date in game.log.
+    def _date_sig_ok(self, addr):
+        """True when `addr` holds the real CDate field triple.
+
+        2026-11-08 (run 16): the ACTUAL 1.19.4.1 layout around the hour counter is
+
+            -0x08 float  hour / 24.0        (0.208333 for 05:00)
+            -0x04 int32  hour               (0..23)
+            +0x00 int32  hour_counter = (year*365 + day_of_year)*24 + hour
+            +0x04 int32  0
+
+        The old test (`-8` is any float in 0.01..0.99 and `+4` is 0..23) also
+        accepts the game's ring buffer of *historical* dates, which is how the
+        clock froze 71 days in the past.
         """
-        # disk cache, valid for the lifetime of this game session
-        import json as _json
+        try:
+            v = self.p.i32(addr)
+            f = struct.unpack("<f", self.p.read(addr - 8, 4))[0]
+            h = self.p.i32(addr - 4)
+            z = self.p.i32(addr + 4)
+        except Exception:
+            return False
+        return (0 <= h <= 23 and z == 0 and (v % 24) == h
+                and abs(f - h / 24.0) < 1e-4
+                and parts_to_date(1930, 1, 1) <= v <= parts_to_date(1948, 1, 1))
+
+    def _date_from_log(self):
+        """Last [YYYY.MM.DD.HH] stamp in the newest game.log -- the most reliable
+        hint when several CDate triples survive (a 1936 campaign keeps the previous
+        session's 1942 date in UI/save metadata, which otherwise wins by size)."""
+        import glob as _g, re as _re, os as _os3
+        best = None
+        for pat in (os.path.expanduser("~/hoi4-*/logs/game.log"),
+                    "/mnt/c/Users/*/Documents/Paradox Interactive/Hearts of Iron IV/logs/game.log"):
+            for f in _g.glob(pat):
+                try:
+                    st = _os3.stat(f)
+                except Exception:
+                    continue
+                if best is None or st.st_mtime > best[0]:
+                    best = (st.st_mtime, f)
+        if not best:
+            return None
+        try:
+            with open(best[1], "rb") as fh:
+                fh.seek(max(0, _os3.path.getsize(best[1]) - 200000))
+                txt = fh.read().decode("utf-8", "replace")
+        except Exception:
+            return None
+        hits = _re.findall(r"\[(\d{4})\.(\d{2})\.(\d{2})\.(\d{2})\]", txt)
+        for y, m, d, h in reversed(hits):
+            try:
+                return parts_to_date(int(y), int(m), int(d), int(h))
+            except Exception:
+                continue
+        return None
+
+    def _find_date_exact(self):
+        """Scan for the exact CDate signature and return the live clock address.
+
+        Event dates in the game are all stored at 00:00, the live clock is not,
+        so midnight candidates are only used when nothing else is left. When more
+        than one candidate survives, the one that actually ticks wins.
+        """
+        import time as _t
+        import numpy as np
+        cache = getattr(self, "_date_exact_cache", None)
+        # 2026-11-10 (review WO-004): the 30 s TTL meant every call older than 30 s
+        # re-walked ~3.8 GB of writable memory and slept 2.5 s inside the gateway
+        # lock. The address stays valid for the whole life of the process; a save
+        # reload / backward jump still invalidates it via find_date_address(force=True).
+        if cache and cache[0] == self.p.pid:
+            if self._date_sig_ok(cache[2]):
+                return cache[2]
+        lo, hi = parts_to_date(1930, 1, 1), parts_to_date(1948, 1, 1)
+        cands = []
+        for m in self.p.regions(writable=True):
+            a = m["start"]
+            while a < m["end"]:
+                n = min(4 << 20, m["end"] - a)
+                n -= n % 4
+                if n <= 0:
+                    break
+                buf = self.p.try_read(a, n)
+                if buf and len(buf) >= 16:
+                    arr = np.frombuffer(buf[: len(buf) - len(buf) % 4], dtype=np.int32)
+                    idx = np.nonzero((arr >= lo) & (arr <= hi))[0]
+                    for i in idx:
+                        cands.append(a + int(i) * 4)
+                    del arr
+                del buf
+                a += n
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+        good = [a for a in cands if self._date_sig_ok(a)]
+        self._date_debug = {
+            "n_cands": len(cands), "n_good": len(good),
+            "good": [(hex(a), self.p.i32(a)) for a in good[:12]],
+            "log_date": self._log_date(), "date_from_log": self._date_from_log(),
+            "depth": getattr(self, "_depth", None),
+        }
+        if not good:
+            return None
+        if len(good) > 1 and getattr(self, "_depth", 0) == 0:
+            # the live clock is the one that moves
+            first = {a: self.p.i32(a) for a in good}
+            # 2026-11-09: 0.4 s is shorter than one game hour at speed 4
+            # (~2.5 s), so the tick test never fired and the scan fell back to
+            # a stale CDate left in the event queue (read 1942.06.23 on a 1936
+            # campaign). 2.5 s guarantees at least one hourly tick.
+            # 2026-11-10 (review WO-004): only when we are NOT inside `with g:` —
+            # an attached injector has every game thread stopped, so nothing can
+            # tick and the sleep is pure added latency (and, when paused, always
+            # fails).
+            _t.sleep(2.5)
+            ticked = [a for a in good if self.p.try_read(a, 4) and self.p.i32(a) != first[a]]
+            if ticked:
+                good = ticked
+        if len(good) > 1:
+            # The game stores scheduled event dates (00:00 or not) with the same
+            # signature; the live clock is the candidate CLOSEST to the last value
+            # we read, never a date months in the future.
+            hint = getattr(self, "_date_last", None)
+            if not hint:
+                hint = self._date_from_log()
+            if not hint:
+                try:
+                    import json as _json2, os as _os2
+                    c = _json2.load(open(_os2.path.join(
+                        _os2.path.dirname(_os2.path.abspath(__file__)), "date_addr.json")))
+                    if c.get("pid") == self.p.pid:
+                        hint = c.get("last")
+                except Exception:
+                    hint = None
+            if hint:
+                near = [a for a in good if abs(self.p.i32(a) - hint) <= 24 * 60]
+                if near:
+                    good = sorted(near, key=lambda a: abs(self.p.i32(a) - hint))[:1]
+        if len(good) > 1:
+            midday = [a for a in good if self.p.i32(a) % 24 != 0]
+            if midday:
+                good = midday
+        if len(good) > 1:
+            good.sort(key=lambda a: -self.p.i32(a))
+        best = good[0]
+        self._date_exact_cache = (self.p.pid, _t.time(), best)
+        return best
+
+    def find_date_address(self, force=False) -> int:
+        """Locate the game date. 1.19.4 layout of a CDate object:
+
+            +0x00 ptr, +0x08 float (0..1, day fraction), +0x0C int32 hour,
+            +0x10 int32 hour_counter = (year*365 + day_of_year)*24 + hour
+
+        So: scan writable memory around the date in game.log, keep int32 values
+        whose -8 dword is a float in (0,1) and whose +4 dword is an hour 0..23,
+        then take the largest (= the live clock, not a cached copy).
+        """
+        import json as _json, numpy as np
+        # 2026-11-06 (run 6): a CDate copy that is permanently frozen must never
+        # come back. The old fallback re-sorted by distance to game.log on every
+        # rescan and re-picked the same dead copy, so a paused-clock read stayed
+        # at 1939.05 for 40 real minutes while the game was at 1939.09.
+        if getattr(self, "_dead_date_pid", None) != self.p.pid:
+            self._dead_date_addrs = set()
+            self._dead_date_pid = self.p.pid
+        dead = self._dead_date_addrs
+        if len(dead) > 200:
+            dead.clear()
         cache_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "date_addr.json")
+        # 2026-11-08 (run 16): try the EXACT CDate signature first. The heuristic
+        # below picks by distance to the game.log stamp, and a stalled log pinned
+        # the clock 71 days in the past inside the game's ring buffer of
+        # historical dates. This path is exact and self-verifying.
+        self._date_verified = False
+        try:
+            exact = self._find_date_exact()
+        except Exception:
+            exact = None
+        if exact:
+            self._date_verified = True
+            self._date_addr = exact
+            self._date_last = self.p.i32(exact)
+            self._date_static = (self._date_last, time.time())
+            try:
+                with open(cache_f, "w") as fh:
+                    _json.dump({"pid": self.p.pid, "base": self.p.base,
+                                "addr": exact, "last": self._date_last}, fh)
+            except Exception:
+                pass
+            return exact
         if not self._date_addr and not force:
             try:
                 with open(cache_f) as fh:
                     c = _json.load(fh)
                 if c.get("pid") == self.p.pid and c.get("base") == self.p.base:
-                    self._date_addr = c["addr"]
+                    if c["addr"] not in dead:
+                        self._date_addr = c["addr"]
+                        if c.get("last"):
+                            self._date_last = c["last"]
             except Exception:
                 pass
-        if self._date_addr and not force:
+        if not force and time.time() < getattr(self, "_date_retry_at", 0):
+            # A scan that found nothing ticking just ran; do not walk 3.8 GB again
+            # until the cooldown expires (the caller falls back to the last value).
+            return 0
+        if self._date_addr and not force and self._date_addr not in dead:
             v = self.p.try_read(self._date_addr, 4)
             if v:
                 cur = struct.unpack("<i", v)[0]
                 if parts_to_date(1900, 1, 1) <= cur <= parts_to_date(2100, 1, 1):
-                    return self._date_addr
-        import numpy as np, time as _t
-        LO = parts_to_date(1933, 1, 1)
-        HI = parts_to_date(1990, 1, 1)
-        addrs, vals = [], []
+                    # The date address must be validated against the game's own
+                    # game.log stamp: the game keeps several stale copies of the
+                    # date around (a loaded save, a world-news stamp, the autosave
+                    # header) and a stale copy reads as a perfectly valid date.
+                    #
+                    # The window has to be WIDE enough that a lagging log does not
+                    # force a rescan: the rescan reads the whole 3.8 GB address
+                    # space and costs 5.9 GB of peak memory, which is what used
+                    # to OOM-kill the MCP child. A 30-day window accepted stale
+                    # copies (the tool reported 1936.12.13 while the game was at
+                    # 1936.08.18), so the stale copy is rejected by a different
+                    # test: it must ADVANCE while we watch it. A stale copy never
+                    # moves.
+                    log_ref = self._log_date()
+                    prev = getattr(self, "_date_last", None)
+                    if prev is not None and cur < prev:
+                        # time went backwards -> stale copy, rescan
+                        dead.add(self._date_addr)
+                        self._date_addr = None
+                    elif log_ref is not None and abs(cur - log_ref) > 24 * 45:
+                        # far away from the game's own stamp -> wrong address
+                        dead.add(self._date_addr)
+                        self._date_addr = None
+                    else:
+                        # The cached address can still be a stale copy that happens
+                        # to sit within 45 days of a lagging game.log (seen on a
+                        # fresh campaign: the tool froze on 1935.12.26 while the
+                        # clock showed 1936.01.30). A live clock advances; when the
+                        # value has not moved for 3 s and the game is NOT paused,
+                        # drop the address and do the ticking scan.
+                        import time as _t
+                        seen = getattr(self, "_date_static", None)
+                        shut = False
+                        if getattr(self, "_date_unverified", False):
+                            # best-effort address from the last fallback: cheap reads
+                            # only, the log clamp + monotonic guard police the value
+                            self._date_last = cur
+                            return self._date_addr
+                        if seen is not None and cur == seen[0] and _t.time() - seen[1] > 3.0:
+                            try:
+                                import session as _sess
+                                shut = bool(_sess.is_paused(self))
+                            except Exception:
+                                shut = True
+                            if not shut:
+                                # Run 8: before declaring the address dead, close
+                                # any popup that is holding the clock and give the
+                                # game 0.3 s to move again.
+                                try:
+                                    self.dismiss_popups_and_unpause()
+                                except Exception:
+                                    pass
+                                _t.sleep(0.3)
+                                _mv = self.p.try_read(self._date_addr, 4)
+                                if _mv and struct.unpack("<i", _mv)[0] != cur:
+                                    _nv = struct.unpack("<i", _mv)[0]
+                                    self._date_last = _nv
+                                    self._date_static = (_nv, _t.time())
+                                    return self._date_addr
+                                dead.add(self._date_addr)
+                                self._date_addr = None
+                        if self._date_addr:
+                            self._date_static = ((cur, _t.time()) if seen is None or cur != seen[0]
+                                                 else seen)
+                            self._date_last = cur
+                            return self._date_addr
+        ref = self._log_date() or self._scan_logs_date()
+        if ref:
+            # game.log can lag behind the live clock (world-news popups, autosaves,
+            # or a freshly loaded campaign). A +/-10 day window then finds no live
+            # clock at all, so keep a wider window around the last log stamp.
+            LO, HI = ref - 24 * 120, ref + 24 * 120
+        else:
+            LO, HI = parts_to_date(1930, 1, 1), parts_to_date(1995, 1, 1)
+        cands = []
         for m in self.p.regions(writable=True):
             a = m["start"]
             while a < m["end"]:
-                n = min(32 << 20, m["end"] - a)
+                n = min(4 << 20, m["end"] - a)
                 n -= n % 4
                 if n <= 0:
                     break
                 buf = self.p.try_read(a, n)
+                arr = None
                 if buf and len(buf) >= 4:
                     arr = np.frombuffer(buf[: len(buf) - len(buf) % 4], dtype=np.int32)
                     idx = np.nonzero((arr >= LO) & (arr <= HI))[0]
                     for i in idx:
-                        addrs.append(a + int(i) * 4)
-                        vals.append(int(arr[i]))
+                        cands.append((int(arr[i]), a + int(i) * 4))
+                    # Keep only the candidates nearest to the log stamp. The old
+                    # code collected every match in a Python list, which is what
+                    # turned this scan into a 5.9 GB allocation.
+                    if len(cands) > 4000:
+                        if ref is not None:
+                            cands.sort(key=lambda kv: abs(kv[0] - ref))
+                        cands = cands[:2000]
+                # `arr` only exists when `buf` was readable: a region that fails to
+                # read on a freshly loaded campaign made `del buf, arr` raise
+                # UnboundLocalError and hoi4_date returned a traceback.
+                del buf
+                if arr is not None:
+                    del arr
                 a += n
-        if not addrs:
+            # Give the freed pages back to the OS: the scan walks gigabytes and
+            # Python's allocator would otherwise hold on to all of it.
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+        if not cands:
             raise RuntimeError("could not find the game date (is a game loaded?)")
-        ref = self._log_date()
-        if ref:
-            keep = [(a, v) for a, v in zip(addrs, vals) if abs(v - ref) <= 24 * 14]
-            if keep:
-                addrs = [a for a, _ in keep]
-                vals = [v for _, v in keep]
-        SIG = 0x3D2AAAAB
-        for a in addrs:
-            d = self.p.try_read(a - 8, 4)
-            if d and struct.unpack("<I", d)[0] == SIG:
-                self._date_addr = a
-                self._save_date_cache()
-                return a
-        # if the game is running, find the value that increases
-        before = dict(zip(addrs, vals))
-        _t.sleep(4.0)
-        movers = []
-        for a, v0 in before.items():
-            d = self.p.try_read(a, 4)
-            if not d:
+        good = []
+        for v, a in cands:
+            if a in dead:
                 continue
-            v1 = struct.unpack("<i", d)[0]
-            if 0 < v1 - v0 <= 72:
-                movers.append(a)
-        if movers:
-            self._date_addr = movers[0]
+            m8 = self.p.try_read(a - 8, 4)
+            p4 = self.p.try_read(a + 4, 4)
+            if not m8 or not p4:
+                continue
+            f = struct.unpack("<f", m8)[0]
+            h = struct.unpack("<i", p4)[0]
+            if 0.01 < f < 0.99 and 0 <= h <= 23:
+                good.append((v, a))
+        if good:
+            # The live clock is the copy that actually ticks. The game's own
+            # game.log stamp is the reference: pick the ticking candidate that is
+            # CLOSEST to it.
+            #
+            # The old code took the LARGEST value ("the live clock is the biggest
+            # copy"), which picked a stale FUTURE copy: the tool reported
+            # 1937.02.28 while the game was at 1936.08.18. Distance to the log
+            # stamp is the reliable criterion.
+            import time as _t
+            ticking = []
+            # Test in ONE detached batch. Inside `with g:` the injector has
+            # stopped every game thread, so NO candidate can tick; the old loop
+            # slept 0.9 s per candidate, concluded "nothing ticks", and the
+            # fallback below then re-picked the same dead copy from `good[0]`.
+            # That is exactly the 1939.05 freeze. Detach for 0.55 s, sample 60
+            # candidates three times, re-attach.
+            sample = [a for _v, a in good[:60] if a not in dead]
+            v1 = v2 = v3 = {}
+            # 2026-11-06 17:53: the detach-and-re-attach version of this batch
+            # test SIGSEGV'd the game (it pokes at the injector from a thread that
+            # does not own the attach session). Only sample while we hold NO
+            # injector; inside `with g:` the game threads are stopped anyway, so
+            # fall through to the log-nearest candidate and let the next
+            # un-attached read verify it.
+            if sample and int(getattr(self, "_depth", 0) or 0) == 0:
+                v1 = {a: self.p.try_read(a, 4) for a in sample}
+                _t.sleep(0.25)
+                v2 = {a: self.p.try_read(a, 4) for a in sample}
+                _t.sleep(0.25)
+                v3 = {a: self.p.try_read(a, 4) for a in sample}
+            for _a in sample:
+                s1, s2, s3 = v1.get(_a), v2.get(_a), v3.get(_a)
+                if not (s1 and s2 and s3):
+                    continue
+                a1, a2, a3 = (struct.unpack("<i", x)[0] for x in (s1, s2, s3))
+                if a1 <= a2 <= a3 and a3 > a1 and (a3 - a1) <= 72:
+                    ticking.append((a3, _a))
+            if ticking:
+                # Among TICKING copies there is normally exactly one (the live
+                # clock); if several, the furthest one is the present, since a
+                # stale copy can never advance past it.
+                ticking.sort(reverse=True)
+                self._date_addr = ticking[0][1]
+                self._date_last = ticking[0][0]
+                self._date_unverified = False
+                self._save_date_cache()
+                return self._date_addr
+            # Nothing ticked right now (the game is paused, or the injector stopped
+            # the game threads for a housekeep while we scanned). Fall back to the
+            # copy nearest game.log, but flag it as unverified: date_raw then applies
+            # the 2-day log clamp and the monotonic guard, so a stale copy can be
+            # rejected without paying for another 3.8 GB scan on every call.
+            # 2026-11-11: "nearest to the log" is wrong when the game is paused:
+            # the log lags the clock by however long nothing happened, so the
+            # nearest copy can be an older stale one. The clock is NEVER behind
+            # the log, so restrict to copies in [log, log+60d] and take the
+            # largest; that skips both the stale past copy and the frozen 1945
+            # copy. Only without such a candidate fall back to nearest.
+            pick = None
+            if ref is not None:
+                window = [kv for kv in good if ref <= kv[0] <= ref + 24 * 60]
+                if window:
+                    window.sort(reverse=True)
+                    pick = window[0]
+                else:
+                    good.sort(key=lambda kv: abs(kv[0] - ref))
+                    pick = good[0]
+            else:
+                good.sort(reverse=True)
+                pick = good[0]
+            self._date_addr = pick[1]
+            self._date_unverified = True
             self._save_date_cache()
-            return movers[0]
-        # last resort: the candidate closest to the date in game.log
-        ref = self._log_date()
-        if ref:
-            best = min(before.items(), key=lambda kv: abs(kv[1] - ref))
-            self._date_addr = best[0]
-            self._save_date_cache()
-            return best[0]
-        self._date_addr = addrs[0]
+            return self._date_addr
+        live = [(v, a) for v, a in cands if a not in dead] or cands
+        best = min(live, key=lambda kv: abs(kv[0] - (ref or kv[0])))
+        self._date_addr = best[1]
         self._save_date_cache()
-        return addrs[0]
+        return best[1]
 
     def _save_date_cache(self):
         import json as _json
@@ -705,28 +1127,387 @@ class HOI4:
         try:
             with open(f, "w") as fh:
                 _json.dump({"pid": self.p.pid, "base": self.p.base,
-                            "addr": self._date_addr}, fh)
+                            "addr": self._date_addr,
+                            "last": getattr(self, "_date_last", None)}, fh)
         except OSError:
             pass
 
-    LOG_PATH = os.path.expanduser(
-        "~/.local/share/Paradox Interactive/Hearts of Iron IV/logs/game.log")
+    # 2026-11-11: the stock Paradox log directory is NOT where this stack writes:
+    # the game may run with -userdir=<somewhere>, so its logs live in
+    # <userdir>/logs. Reading the default directory picked up files from an old
+    # 1942 campaign and date_raw() clamped every fresh 1936 campaign to
+    # 1942.06.23 (the "date stuck at 1942" bug). Resolve the userdir from the
+    # live process cmdline; HOI4_GAME_LOG / HOI4_ERROR_LOG still win.
+    @staticmethod
+    def _userdir_log_dir():
+        try:
+            import subprocess
+            cmd = subprocess.run(["ps", "-p", str(os.getpid()), "-o", "cmd="],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            cmd = ""
+        return cmd
+
+    def _log_paths(self):
+        env_g = os.environ.get("HOI4_GAME_LOG")
+        env_e = os.environ.get("HOI4_ERROR_LOG")
+        if env_g and env_e:
+            return env_g, env_e
+        ud = getattr(self, "_hoi4_userdir", None)
+        if ud is None:
+            ud = ""
+            try:
+                cmd = open("/proc/%d/cmdline" % self.p.pid, "rb").read().split(b"\0")
+                for tok in cmd:
+                    t = tok.decode("utf-8", "replace")
+                    if t.startswith("-userdir="):
+                        ud = t.split("=", 1)[1]
+                        break
+            except Exception:
+                ud = ""
+            self._hoi4_userdir = ud
+        if ud:
+            base = os.path.join(ud, "logs")
+            return (env_g or os.path.join(base, "game.log"),
+                    env_e or os.path.join(base, "error.log"))
+        d = os.path.expanduser("~/.local/share/Paradox Interactive/Hearts of Iron IV/logs")
+        return env_g or os.path.join(d, "game.log"), env_e or os.path.join(d, "error.log")
+
+    LOG_PATH = os.environ.get(
+        "HOI4_GAME_LOG",
+        os.path.expanduser("~/.local/share/Paradox Interactive/Hearts of Iron IV/logs/game.log"))
+
+    ERROR_LOG_PATH = os.environ.get(
+        "HOI4_ERROR_LOG",
+        os.path.expanduser("~/.local/share/Paradox Interactive/Hearts of Iron IV/logs/error.log"))
 
     def _log_date(self):
-        """The last [YYYY.MM.DD.HH] stamp in game.log, as a Clausewitz hour value."""
+        """The last [YYYY.MM.DD.HH] stamp in game.log / error.log, as a Clausewitz hour.
+
+        2026-11-06 (run 7): game.log only gets a line when an event fires, so it
+        can sit a month behind the clock and every log-based sanity check then
+        accepted a stale CDate copy (the tool reported 1936.03.05 while the game
+        was at 1936.04.08). error.log carries an hourly decision warning in this
+        mod, so the LAST stamp of either file is an accurate lower bound for the
+        live clock — and neither file can ever be ahead of it.
+        """
+        best = None
+        for path in self._log_paths():
+            try:
+                with open(path, "r", errors="replace") as f:
+                    txt = f.read()[-200000:]
+            except OSError:
+                continue
+            ms = re.findall(r"\[(\d{4})\.(\d{2})\.(\d{2})\.(\d{2})\]", txt)
+            if not ms:
+                continue
+            y, mo, d, h = (int(x) for x in ms[-1])
+            v = parts_to_date(y, mo, d, h)
+            if best is None or v > best:
+                best = v
+        return best
+
+    def dismiss_popups_and_unpause(self):
+        """Close a blocking World News / event popup and clear the pause flag.
+
+        Run 7 lost ten months of game time to a single open news window: the
+        clock stood still, every front tick was skipped, and 110 divisions
+        watched Poland. Return activates a popup's default button and is
+        harmless on the map (Escape would open the main menu, so never use it).
+        The idler's pause byte (+0x6C1) is the same one `session.is_paused`
+        reads; clearing it resumes the clock even when no popup has focus.
+        """
         try:
-            with open(self.LOG_PATH, "r", errors="replace") as f:
-                txt = f.read()[-200000:]
-        except OSError:
-            return None
-        ms = re.findall(r"\[(\d{4})\.(\d{2})\.(\d{2})\.(\d{2})\]", txt)
-        if not ms:
-            return None
-        y, mo, d, h = (int(x) for x in ms[-1])
-        return parts_to_date(y, mo, d, h)
+            import subprocess
+            for disp in (":1", ":0"):
+                subprocess.run(
+                    ["env", "DISPLAY=%s" % disp, "XDG_RUNTIME_DIR=/run/user/1001",
+                     "xdotool", "key", "Return"],
+                    timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        try:
+            idler = self.p.u64(self.va(0x459E908))
+            if idler and self.p.u8(idler + 0x6C1) != 0:
+                self.p.write(idler + 0x6C1, b"\x00")
+        except Exception:
+            pass
+        return True
 
     def date_raw(self) -> int:
-        return self.p.i32(self.find_date_address())
+        """Read the live clock and re-locate it when the cached one stops ticking.
+
+        A fresh game process is usually PAUSED at the main menu / campaign start,
+        so the first scan cannot distinguish the live clock from a stale copy and
+        falls back to the value nearest game.log.  That copy then never advances
+        and every date-based feature (front tick gate, wait_for, war days) freezes.
+        When the game is running and the cached value has been static for >3 s,
+        force one scan; that scan can now see which candidate ticks.
+
+        2026-11-04: every value is now bounds-checked to [1930, 1960]. A freed heap
+        chunk that used to hold a CDate still parses as a valid int32, which is how
+        `hoi4_date` reported 112217.05.06 / 0000.08.03 and once triggered a
+        premature war-goal justification. Outside the window the address is dropped
+        and the game's own log stamp is used instead.
+        """
+        # 2026-11-06: LO was 1936.01.01, but a fresh campaign keeps stale CDate
+        # copies from the day BEFORE the start (1935.12.26/27). Those made every
+        # `date_raw` fail the range test, rescan the whole 3.8 GB address space
+        # (5 s of CPU) and do it again on the next call — the child sat at 60 %
+        # CPU and the driver blocked for minutes. The log floor below turns such
+        # a copy into the correct date instead of rejecting it.
+        # 2026-11-10: HI was 1946.01.01, but this campaign is in November 1946, so
+        # every genuine clock reading was rejected as out of range and the code fell
+        # back to a stale CDate copy (it reported 1942.06.23 for weeks of play).
+        LO, HI = parts_to_date(1935, 1, 1), parts_to_date(1965, 1, 1)
+        # A NEW game process invalidates every date pointer we hold. The MCP server
+        # keeps one Game object across game restarts, and the old address can still
+        # read as a plausible date in the new process (it showed 1935.12.26 12:00,
+        # the campaign start stamp, on a game that was at 1936.01.05).
+        try:
+            _pid = self.p.pid
+        except Exception:
+            _pid = None
+        if getattr(self, "_date_pid", None) != _pid:
+            self._date_pid = _pid
+            self._date_addr = None
+            self._date_last = None
+            self._date_static = None
+            self._date_retry_at = 0
+            self._date_high = None
+        addr = self.find_date_address()
+        if addr and getattr(self, "_date_verified", False):
+            # The address came from the EXACT CDate signature scan (float hour/24 at
+            # -8, hour at -4, counter at 0, zero at +4). Every heuristic below
+            # compares against game.log, and a stalled log clamps a perfectly good
+            # clock (that is exactly how the 71-day drift happened), so a verified
+            # read bypasses them.
+            v = self.p.i32(addr)
+            # 2026-11-11: EXCEPT when the "verified" object is a stale CDate copy
+            # years ahead of the game's own log. A frozen 1945.04.04 CDate matches
+            # the signature perfectly (float, hour, counter, zero) and used to be
+            # returned forever, which pinned a fresh 1936 campaign to 1945 — every
+            # date-based gate then believed nine years had passed. The log stamp
+            # can lag the clock but can never be months behind it, so it wins.
+            _lrv = self._log_date()
+            if (LO <= v <= HI and _lrv and LO <= _lrv <= HI
+                    and v > _lrv + 24 * 60):
+                try:
+                    self._dead_date_addrs.add(addr)
+                except Exception:
+                    pass
+                self._date_addr = None
+                self._date_verified = False
+                addr = None
+            elif LO <= v <= HI and not (_lrv and v < _lrv - 48):
+                self._date_last = v
+                self._date_static = (v, time.time())
+                self._date_high = v
+                return v
+            elif LO <= v <= HI:
+                # 2026-11-11: a "verified" address can still hold a STALE CDate
+                # copy that has fallen behind game.log (seen: tool 1938.06.30,
+                # log 1938.07.24, screen 1938.08.28). game.log cannot be ahead of
+                # the clock, so a read more than two days behind it is dead.
+                try:
+                    self._dead_date_addrs.add(addr)
+                except Exception:
+                    pass
+                self._date_addr = None
+                self._date_verified = False
+                addr = None
+                v = 0
+        v = self.p.i32(addr) if addr else 0
+        if not (LO <= v <= HI):
+            if addr:
+                self._date_addr = None
+            try:
+                a2 = self.find_date_address(force=True)
+                v = self.p.i32(a2) if a2 else 0
+            except Exception:
+                v = 0
+        now = time.time()
+        if LO <= v <= HI and addr and getattr(self, "_date_last", None) is None:
+            # FIRST read of this process: the scan may have happened while the
+            # clock was not yet ticking (a fresh campaign is paused at
+            # 1935.12.26 12:00), and the log-proximity fallback can then bind to a
+            # historical CDate copy. If the game is running, a live clock moves
+            # within 0.3 s; one that does not is stale, so rescan once.
+            try:
+                import session as _sess0
+                _run = not _sess0.is_paused(self)
+            except Exception:
+                _run = True
+            if _run:
+                time.sleep(0.3)
+                if self.p.i32(addr) == v:
+                    self._date_addr = None
+                    try:
+                        v = self.p.i32(self.find_date_address(force=True))
+                    except Exception:
+                        pass
+        if LO <= v <= HI:
+            # A read that lags the game's OWN log stamp by more than 60 days is a
+            # stale CDate copy, not a slow clock: game.log records real events
+            # (declarations, focus completions) and cannot be months ahead of the
+            # session. This is what caught the 1936.08.16 vs 1937.03.02 flap.
+            log_ref = self._log_date()
+            if log_ref and LO <= log_ref <= HI and v < log_ref - 24 * 2:
+                # game.log is written AS the game runs, so it can lag the live clock
+                # but can never be AHEAD of it. A read that is more than two days
+                # behind the log is therefore a stale CDate copy (seen: 1935.12.26
+                # on a game whose clock and log both said 1936.01).
+                self._date_addr = None
+                try:
+                    a2 = self.find_date_address(force=True)
+                    v2 = self.p.i32(a2) if a2 else 0
+                    if LO <= v2 <= HI and v2 > v:
+                        v = v2
+                except Exception:
+                    pass
+                if v < log_ref - 24 * 2:
+                    v = log_ref
+            prev = getattr(self, "_date_last", None)
+            if prev and LO <= prev <= HI and v < prev - 240:
+                # Time does not run backwards except when a save is loaded. A copy
+                # that is 10+ days older than the last reading is a stale CDate in
+                # the heap, not a reload: rescan once, then accept whatever we get.
+                self._date_addr = None
+                try:
+                    v2 = self.p.i32(self.find_date_address(force=True))
+                    if LO <= v2 <= HI and v2 >= prev - 240:
+                        v = v2
+                except Exception:
+                    pass
+                if v < prev - 240:
+                    v = prev          # hold the last good clock, never run backwards
+            # --- monotonic high-water mark (2026-11-05) --------------------------
+            # A 2026-11-05 run reported 1936.05.27 and then 1936.02.18: the scan had
+            # bound to a stale CDate copy, and a 99-day dip is inside the +-240 h
+            # guard above. In-game time never moves backwards inside one process, so
+            # hold the highest value ever read; a genuine reload needs an MCP restart.
+            hi = getattr(self, "_date_high", None)
+            _lrhi = self._log_date()
+            if (hi is not None and _lrhi and LO <= _lrhi <= HI
+                    and hi > _lrhi + 24 * 90):
+                # 2026-11-06: a scan made before the campaign existed (main menu,
+                # game.log not written yet) seeded this mark from a garbage 1945
+                # CDate copy, and the final high-water re-apply below then undid
+                # every log clamp — the clock was pinned to 1945.04.27 for the
+                # whole session while the game sat at 1936.01.01. game.log can
+                # never be months behind the live clock, so the mark is wrong.
+                hi = self._date_high = _lrhi
+            if hi is None:
+                # Never seed the mark from an UNVERIFIED read: that is exactly
+                # how the 1945 copy became permanent.
+                seed = (v if not getattr(self, "_date_unverified", False)
+                        else (_lrhi or v))
+                try:
+                    _lr = self._log_date()
+                    if _lr and LO <= _lr <= HI and _lr > seed:
+                        seed = _lr
+                except Exception:
+                    pass
+                hi = self._date_high = seed
+            if v < hi:
+                self._date_addr = None
+                try:
+                    v2 = self.p.i32(self.find_date_address(force=True))
+                    if LO <= v2 <= HI and v2 >= hi:
+                        v = v2
+                except Exception:
+                    pass
+                if v < hi:
+                    v = hi
+            if v > hi and not getattr(self, "_date_unverified", False):
+                self._date_high = v
+            # A read that is more than 60 days AHEAD of the game's own log stamp is a
+            # garbage heap value that happens to fall inside [1930,1960] (seen right
+            # after a save reload: 1959.09.14 on a game at 1940.01.01). game.log
+            # cannot be months behind the live clock, so it wins.
+            _lr2 = self._log_date()
+            if _lr2 and LO <= _lr2 <= HI and v > _lr2 + 24 * 60:
+                self._date_addr = None
+                v = _lr2
+                self._date_high = _lr2
+            # Single-step forward jump guard: more than 30 days between two reads is
+            # only believable when the game's own log stamp is in the same window.
+            _prev2 = getattr(self, "_date_last", None)
+            if _prev2 and LO <= _prev2 <= HI and v - _prev2 > 24 * 30:
+                _lr3 = self._log_date()
+                if not (_lr3 and LO <= _lr3 <= HI and abs(v - _lr3) < 24 * 15):
+                    v = _prev2
+                    self._date_high = _prev2
+            seen = getattr(self, "_date_static", None)
+            if seen is not None and v == seen[0]:
+                if now - seen[1] > 3.0:
+                    try:
+                        import session
+                        paused = session.is_paused(self)
+                    except Exception:
+                        paused = True
+                    if not paused:
+                        # This copy has been frozen for >3 s while the game runs:
+                        # it is a dead CDate, blacklist it BEFORE the rescan so
+                        # the scan cannot hand the same address straight back.
+                        _dead = getattr(self, "_dead_date_addrs", None)
+                        if _dead is not None and self._date_addr:
+                            _dead.add(self._date_addr)
+                        self._date_addr = None
+                        addr = self.find_date_address(force=True)
+                        v2 = self.p.i32(addr)
+                        if LO <= v2 <= HI:
+                            v = v2
+                        # 2026-11-06: this branch used to `return v` immediately,
+                        # bypassing every guard below. A fresh campaign then reported
+                        # 1945.04.27 while game.log said 1936.01.01.12.
+                        _lr3 = self._log_date()
+                        if _lr3 and LO <= _lr3 <= HI and v > _lr3 + 24 * 60:
+                            # one-directional: only a read AHEAD of the log is garbage.
+                            # (the bidirectional version dragged the clock 25 days back
+                            # whenever game.log had not been written for two months)
+                            v = _lr3
+                            self._date_high = _lr3
+                        self._date_static = (v, now)
+            else:
+                self._date_static = (v, now)
+            # 2026-11-06: the `_date_static` rescan above runs AFTER the monotonic
+            # guard and used to adopt an older CDate copy (seen: 1938.10 -> 1938.09.17
+            # repeatedly). Re-apply the high-water mark before returning.
+            _hi2 = getattr(self, "_date_high", None)
+            _lr5 = self._log_date()
+            if (_hi2 and _lr5 and LO <= _lr5 <= HI
+                    and _hi2 > _lr5 + 24 * 90):
+                # Same garbage-mark guard, re-applied at the very end.
+                _hi2 = self._date_high = _lr5
+            if _hi2 and LO <= _hi2 <= HI and v < _hi2:
+                v = _hi2
+            # 2026-11-06 (run 6): game.log is written AS the game runs, so a read
+            # that is more than a day BEHIND the last log stamp is a stale or
+            # frozen copy. This is the last line of defence against the 40-minute
+            # 1939.05 freeze that made the front skip every tactical tick.
+            if _lr5 and LO <= _lr5 <= HI and _lr5 > v:
+                v = _lr5
+                if not _hi2 or _lr5 > _hi2:
+                    self._date_high = _lr5
+            self._date_last = v
+            return v
+        # Out of range even after a forced rescan: trust the game's own log stamp,
+        # then the last good value. Never hand a garbage "112217" to a driver.
+        # 2026-11-06: `_date_last` itself can be poisoned — a scan made at the
+        # main menu (game.log not written yet) picked a 1945 CDate copy and this
+        # fallback then returned it forever (hoi4_date said 1945.04.27 while the
+        # campaign sat at 1936.01.01). A value months ahead of game.log is the
+        # garbage one, so drop it and prefer the log.
+        _lr = self._log_date()
+        _last = getattr(self, "_date_last", None)
+        if _last and _lr and LO <= _lr <= HI and _last > _lr + 24 * 90:
+            _last = None
+        for fb in (_last, _lr, self._scan_logs_date()):
+            if fb and LO <= fb <= HI:
+                self._date_last = fb
+                return fb
+        return v
 
     def date(self) -> dict:
         h = self.date_raw()

@@ -18,7 +18,7 @@ entrenchment and supply are all already accounted for.
 """
 import struct
 
-G_GAMESTATE = 0x43F2648
+G_GAMESTATE = 0x459E9F0   # 1.19.4.1 (was 0x43F2648)
 GS_COMBATS  = 0x268
 
 LC_SIDE_A, LC_SIDE_B = 0x28, 0x30
@@ -166,6 +166,53 @@ def report(g):
     return [{k: v for k, v in c.items() if not k.startswith("_")} for c in combats(g)]
 
 
+A_TMPL = 0x3B8
+A_STR_DAMAGE, A_ORG_DAMAGE, A_KILLED = 0x448, 0x450, 0x678
+
+
+def active_division_combats(g, tags=None, limit=80):
+    """Fallback for `combats()` returning 0 in civil wars / fresh saves.
+
+    The CGameState+combats pointer is not reliable there. Every division that has
+    taken strength or organisation damage is still visible on the CArmy object,
+    so report those instead of claiming "no combat".
+    """
+    from game import CO_ARMIES, _arr, item_name
+    p = g.p
+    if tags is None:
+        tags = [g.player_tag()] + [t for t in enemy_tags(g) if t != g.player_tag()]
+    out = []
+    for t in tags:
+        try:
+            c = g.country(t)
+        except Exception:
+            continue
+        for d in _arr(p, c.ptr, CO_ARMIES):
+            try:
+                sd = _fx(p, d + A_STR_DAMAGE)
+                od = _fx(p, d + A_ORG_DAMAGE)
+                if sd <= 0.01 and od <= 0.01:
+                    continue
+                tmpl = p.u64(d + A_TMPL)
+                out.append({
+                    "tag": t,
+                    "division": hex(d),
+                    "province": p.i32(p.u64(d + ATTACK_PROV) + PROV_ID)
+                                if p.u64(d + ATTACK_PROV) else None,
+                    "template": item_name(p, tmpl + 0x20) if tmpl else None,
+                    "str": round(_fx(p, d + A_STR), 3),
+                    "org": round(_fx(p, d + A_ORG), 1),
+                    "str_damage": round(sd, 3),
+                    "org_damage": round(od, 3),
+                    "killed": p.i32(d + A_KILLED),
+                    "out_of_supply_days": p.i32(d + A_OOS),
+                })
+            except Exception:
+                continue
+    out.sort(key=lambda r: -(r["org_damage"] + r["str_damage"] * 100))
+    return {"count": len(out), "tags": tags, "divisions": out[:limit]}
+
+
 ATTACK_PROV = 0x1F0     # CArmy -> the CProvince it is in
 
 
@@ -240,6 +287,34 @@ def war_relations(g, tag=None):
         return []
     if not mine:
         return []
+
+    # 2026-11-04: CDiplomacyStatus+0x20 also holds non-war relations in 1.19.4.1
+    # (trade agreements, opinion modifiers). Germany and Romania share a Romanian
+    # oil-trade object, which is exactly how `hoi4_wartime_status` reported
+    # "at war with ROM" for four years of peace. Only accept an element whose RTTI
+    # class actually is a war relation. If RTTI cannot name any of them, the list
+    # is only believed when the battle counter proves that fighting is happening.
+    keep, unknown = [], 0
+    for wr in mine:
+        try:
+            cls = g.oi.class_of(wr) or ""
+        except Exception:
+            cls = ""
+        if not cls:
+            unknown += 1
+            keep.append(wr)
+        elif "War" in cls:
+            keep.append(wr)
+    if unknown == len(mine):
+        try:
+            fighting = p.i32(c.ptr + CO_ARMIES_IN_COMBAT) > 0 or bool(combats(g, only_mine=True))
+        except Exception:
+            fighting = False
+        if not fighting:
+            return []
+    mine = keep
+    if not mine:
+        return []
     want = set(mine)
     sides = {}
     for t in g.tags():
@@ -261,7 +336,114 @@ def war_relations(g, tag=None):
             threat = None
         for enemy in others:
             out.append({"enemy": enemy, "me": me_tag, "threat": threat, "_ptr": wr})
-    return out
+    if out:
+        return out
+    # FALLBACK: in 1.19.4.1 the diplomacy records of a country that is AT WAR can
+    # be empty, so the enemy cannot be found that way. Find it from the armies
+    # instead: every CArmy carries its owner's country pointer, and the armies
+    # that are in combat belong to the enemy.
+    return _enemies_from_armies(g, me_tag)
+
+
+def _enemies_from_armies(g, me_tag):
+    """Enemy tags of the countries whose armies are FIGHTING OURS.
+
+    `num_armies_in_combat` is a WORLD counter, so it cannot be used on its own.
+    The reliable signal is the battle list: a CLandCombat has two sides, and
+    each side's divisions carry their owner's country pointer. A battle with one
+    of our divisions on one side and theirs on the other names the enemy.
+    """
+    p = g.p
+    A_COUNTRY = 0x1D8
+    try:
+        from game import _arr
+        from game import item_name
+    except Exception:
+        return []
+    # tag for a country pointer
+    ptr2tag = {}
+    for t in g.tags():
+        try:
+            ptr2tag[g.country(t).ptr] = t
+        except Exception:
+            continue
+    enemies = []
+    try:
+        recs = combats(g, only_mine=True)
+    except Exception:
+        recs = []
+    for rec in recs:
+        try:
+            sides = rec.get("_us", {}), rec.get("_them", {})
+        except Exception:
+            continue
+        for side in sides:
+            for d in side.get("_all", []):
+                cp = p.u64(d + A_COUNTRY)
+                tag = ptr2tag.get(cp)
+                if tag and tag != me_tag and tag not in enemies:
+                    enemies.append(tag)
+    if enemies:
+        return [{"enemy": t, "me": me_tag, "threat": None, "_ptr": None} for t in enemies]
+    # The battle list can be empty (CGameState+combats is unreliable in some
+    # saves), so go by geography: the enemy is the country that owns armies in
+    # the provinces where OUR armies are.
+    try:
+        from game import _arr
+        our_provs = {}
+        for a in _arr(p, g.country(me_tag).ptr, 0x290):
+            try:
+                pr = p.u64(a + 0x1F0)
+                if pr:
+                    our_provs.setdefault(p.i32(pr + 0xA4), []).append(a)
+            except Exception:
+                continue
+        if not our_provs:
+            return []
+        for t in g.tags():
+            if t == me_tag:
+                continue
+            try:
+                c = g.country(t)
+                armies = _arr(p, c.ptr, 0x290)
+            except Exception:
+                continue
+            if not armies:
+                continue
+            for a in armies:
+                try:
+                    pr = p.u64(a + 0x1F0)
+                    if pr and p.i32(pr + 0xA4) in our_provs:
+                        enemies.append(t)
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    if enemies:
+        return [{"enemy": t, "me": me_tag, "threat": None, "_ptr": None} for t in enemies]
+    # Fall back to the world counter: any country with armies in combat.
+    try:
+        from game import _arr
+        mine = {p.u64(a + A_COUNTRY)
+                for a in _arr(p, g.country(me_tag).ptr, 0x290)}
+    except Exception:
+        return []
+    for t in g.tags():
+        if t == me_tag:
+            continue
+        try:
+            c = g.country(t)
+            if p.i32(c.ptr + 0x12F0) <= 0:
+                continue
+            armies = _arr(p, c.ptr, 0x290)
+        except Exception:
+            continue
+        for a in armies:
+            if p.u64(a + A_COUNTRY) in mine:
+                enemies.append(t)
+                break
+    return [{"enemy": t, "me": me_tag, "threat": None, "_ptr": None} for t in enemies]
 
 
 def at_war(g, tag=None):

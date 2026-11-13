@@ -87,8 +87,17 @@ def ruling_ideology(g, tag=None):
     own = g._inj is None
     if own: g.attach()
     try:
-        r = g.call(FN_TOKEN_STR, [tok])
-        return p.cstr(p.u64(r)) if r else None
+        try:
+            # WO-011: FN_TOKEN_STR (1.19.2) is not in the verified-call list and
+            # would SIGSEGV. fieldmap.token_name() reads G_TOKEN_TABLE instead.
+            from fieldmap import token_name as _tn
+            r = _tn(g, tok)
+        except Exception:
+            # 1.19.4.1: FN_TOKEN_STR adresi bu build'de gecersiz, cagirmak oyunu
+            # SIGSEGV ile dusuruyor. Ideoloji cozulemezse kurallar "bilinmiyor"
+            # sayilir ve general listesi kisitlanmaz.
+            return None
+        return r if isinstance(r, str) else None
     finally:
         if own: g.detach()
 

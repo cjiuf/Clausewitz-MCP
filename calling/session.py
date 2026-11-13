@@ -7,8 +7,11 @@ rules the multiplayer session enforces.
 """
 import struct
 
-G_IDLER      = 0x43F2598
-G_GAMESTATE  = 0x43F2648
+# 1.19.4.1 (f584) globals. These used to be the 1.19.2 addresses, which made
+# is_paused() read a random byte (0xF4 -> always "paused") and date_raw() never
+# self-heal. Keep them in one place; commands.py uses IDLER_GLOBAL = 0x459E908.
+G_IDLER      = 0x459E908
+G_GAMESTATE  = 0x459E9F0
 IDLER_COUNTRY_NAME = 0x620    # std::string, name of the played country
 IDLER_LOCAL_PLAYER = 0x7C0    # std::string, local player name
 SESSION_NET  = 0x58           # CSession+0x58 -> network object (CProxyServer)
@@ -19,10 +22,14 @@ GS_COMBATS   = 0x268          # active land battles (CLandCombat*)
 
 IDLER_PAUSED = 0x6C1          # 1 = paused, 0 = running (+0x6C3 mirrors it)
 
-# CPauseGame (vtable 0x42B4868). A player command, so it works in multiplayer too.
-PAUSE_CTOR   = 0x2095400      # (this, std::string* who, u8 pause, u8 flag)
-PAUSE_CANEXE = 0x20955A0      # always true
-PAUSE_SIZE   = 0x50
+# CPauseGame: vtable 0x4460D70 (1.19.4.1), object size 0x50.
+# Verified by disassembling the constructors (0x21BAE00 default, 0x21BAE60 copy):
+#   +0x28 std::string _M_p  -> +0x38 (SSO buffer)      +0x30 _M_string_length
+#   +0x38 char[16] local buffer                        +0x48 u8 "pause"  +0x49 u8 flag
+# The old PAUSE_CTOR 0x2095400 was a 1.19.2 address and segfaulted on every call,
+# which is why hoi4_pause had to fall back to xdotool. No constructor call now.
+VT_PAUSE_GAME = 0x4460D70
+PAUSE_SIZE    = 0x50
 
 
 def _std_string(p, addr):
@@ -131,50 +138,119 @@ def is_paused(g):
 def pause(g, paused=True, who=None):
     """Pause or resume: the same command as the player's space key.
 
-    NOTE: `CPauseGame` is a TOGGLE. The u8 argument does not mean "pause/resume";
-    whatever is passed, the state flips. This field was once taken for a set-value,
-    so `pause(False)` sometimes PAUSED the game and divisions never moved. The real
-    state is now read first (idler+0x6C1) and the toggle is only sent when it
-    differs, the same as pressing space once, when needed.
+    `CPauseGame` carries the DESIRED state in +0x48 (it is not a blind toggle: the
+    Execute path forwards that byte to idler->vt[+0x2B8]). The state is still read
+    first (idler+0x6C1) so a redundant command is never queued.
     """
     want = bool(paused)
-    if is_paused(g) == want:
-        return True, "already %s" % ("paused" if want else "running")
-    ok, err = _toggle(g, who)
-    if not ok:
-        return False, err
     import time as _t
-    for _ in range(10):
-        _t.sleep(0.05)
-        if is_paused(g) == want:
-            return True, ""
-    return False, "toggle sent but the state did not change"
+
+    def running_proof():
+        """The clock moved -> really running (the pause flag alone lies at start)."""
+        before = g.date_raw()
+        _t.sleep(1.5)
+        return g.date_raw() != before
+
+    if is_paused(g) == want:
+        if want:
+            return True, "already paused"
+        if running_proof():
+            return True, "already running"
+    ok, err = _toggle(g, who, want)
+    if ok:
+        for _ in range(10):
+            _t.sleep(0.05)
+            if is_paused(g) == want:
+                if want or running_proof():
+                    return True, ""
+                break
+    # 1.19.4.1: CPauseGame(+0x48=1) pauses correctly, but +0x48=0 does NOT resume
+    # (the engine ignores the resume through this command; verified live 2026-11-04
+    # and again 2026-11-05 on a fresh campaign). Fall back to the player's own UI:
+    # the clock/pause icon in the top bar. Keyboard events never reach the SDL
+    # window under this headless X server, but mouse clicks do.
+    if not want:
+        for attempt in (_click_pause_button, _key_toggle):
+            if attempt():
+                for _ in range(14):
+                    _t.sleep(0.2)
+                    if running_proof():
+                        return True, ""
+    return False, err or ("pause command accepted but the state did not change")
 
 
-def _toggle(g, who=None):
-    """FLIP the pause state (the player's space key).
+def _click_pause_button(display=None):
+    """Click the pause icon in the top bar (window-relative, right-aligned)."""
+    import os, subprocess
+    disp = display or os.environ.get("HOI4_DISPLAY") or ":1"
+    env = dict(os.environ, DISPLAY=disp)
+    try:
+        ids = subprocess.run(["xdotool", "search", "--name", "Hearts of Iron"],
+                             capture_output=True, text=True, env=env, timeout=10).stdout.split()
+        if not ids:
+            return False
+        wid = ids[-1]
+        geo = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                             capture_output=True, text=True, env=env, timeout=10).stdout
+        width = 1280
+        for line in geo.splitlines():
+            if line.startswith("WIDTH="):
+                width = int(line.split("=", 1)[1])
+        subprocess.run(["xdotool", "mousemove", "--window", wid, str(width - 290), "22"],
+                       timeout=10, env=env)
+        subprocess.run(["xdotool", "click", "1"], timeout=10, env=env)
+        return True
+    except Exception:
+        return False
 
-    Because the command is a toggle, the u8 argument does not change the outcome;
-    1 is sent and the constructor is checked for having written the field. Which
-    direction to go is `pause()`'s decision. This only presses the key.
+
+def _key_toggle(display=None):
+    """Press space in the game window (works where the command path does not)."""
+    import os, subprocess
+    disp = display or os.environ.get("HOI4_DISPLAY") or ":1"
+    try:
+        ids = subprocess.run(["xdotool", "search", "--name", "Hearts of Iron"],
+                             capture_output=True, text=True,
+                             env=dict(os.environ, DISPLAY=disp), timeout=10).stdout.split()
+        if ids:
+            subprocess.run(["xdotool", "windowactivate", ids[0]], timeout=10,
+                           env=dict(os.environ, DISPLAY=disp),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["xdotool", "key", "space"], timeout=10,
+                       env=dict(os.environ, DISPLAY=disp),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _toggle(g, who=None, want=True):
+    """Build CPauseGame (0x50 bytes, vtable 0x4460D70) directly in memory.
+
+    Pure struct construction, no constructor call: the 1.19.2 ctor address
+    (0x2095400) is not a function in this binary.
     """
+    import struct as _s
+    from commands import BASE_INIT
     p = g.p
-    who = who or (_idler_name(g) or "AI")
+    who = (who or (_idler_name(g) or "AI")).encode("utf-8", "replace")[:15]
     own = g._inj is None
     if own:
         g.attach()
     try:
-        s = g.malloc(0x20)
-        raw = who.encode()[:15]
-        p.write(s, struct.pack("<QQ", s + 0x10, len(raw)) + raw + b"\0" * (16 - len(raw)))
         cmd = g.malloc(PAUSE_SIZE)
-        p.write(cmd, b"\0" * PAUSE_SIZE)
-        g.call(PAUSE_CTOR, [cmd, s, 1, 0])
-        if p.u8(cmd + 0x48) != 1:
-            return False, "pause flag was not written"
-        if not (g.call(PAUSE_CANEXE, [cmd, 0]) & 0xFF):
-            return False, "CanExecute returned false"
-        g.cmd.post(cmd)
+        blob = bytearray(PAUSE_SIZE)
+        _s.pack_into("<Q", blob, 0x00, p.base + VT_PAUSE_GAME)
+        for off, fmt, val in BASE_INIT:
+            _s.pack_into(fmt, blob, off, val)
+        _s.pack_into("<QQ", blob, 0x28, cmd + 0x38, len(who))
+        blob[0x38:0x38 + len(who)] = who
+        blob[0x48] = 1 if want else 0
+        blob[0x49] = 0
+        p.write(cmd, bytes(blob))
+        rv = g.cmd.post(cmd)
+        if not (rv & 0xFF):
+            return False, getattr(g.cmd, "last_error", "") or "CCommand::Run refused CPauseGame"
         return True, ""
     finally:
         if own:

@@ -301,22 +301,161 @@ def province_owner_map(g, with_ptrs=False):
     return byid, byptr
 
 
-def province_objects(g):
-    """province_id -> CProvince*"""
-    p = g.p
+# CProvince vtable offset in 1.19.4.1 (f584). CProvince objects live in a heap
+# region that ObjectIndex's writable-only scan does NOT cover, so we look for the
+# vtable in every readable mapping once and cache the result on disk.
+PROV_VT_OFF = 0x4390588
+PROV_PTR_CACHE = os.path.join(HERE, "prov_ptrs.json")
+PROV_MAX_ID = 30000
+
+
+def province_objects(g, force=False):
+    """province_id -> CProvince* (cached; one full scan per game process)."""
+    key = ("prov_objs", g.p.pid, g.p.base)
+    if not force and key in _MEM:
+        return _MEM[key]
+    try:
+        import json
+        c = json.load(open(PROV_PTR_CACHE))
+        # Never trust an empty/partial cache: the background staff fires a tick
+        # while the game is still on the main menu, finds no CProvince at all,
+        # and would otherwise poison this pid for the whole session.
+        if (c.get("pid") == g.p.pid and c.get("base") == g.p.base
+                and len(c.get("ptrs") or {}) > 1000):
+            _MEM[key] = {int(k): int(v) for k, v in c["ptrs"].items()}
+            return _MEM[key]
+    except Exception:
+        pass
+    vt = g.p.base + PROV_VT_OFF
+    needle = struct.pack("<Q", vt)
+    hits = g.p.scan_value(needle, g.p.regions(writable=False))
     out = {}
-    for pr in g.oi.instances("CProvince"):
+    for h in hits:
         try:
-            out[p.i32(pr + PROV_ID)] = pr
+            pid = g.p.i32(h + PROV_ID)
+        except OSError:
+            continue
+        if 0 < pid < PROV_MAX_ID:
+            out.setdefault(pid, h)
+    if len(out) > 1000:
+        try:
+            import json
+            json.dump({"pid": g.p.pid, "base": g.p.base,
+                       "ptrs": {str(k): v for k, v in out.items()}},
+                      open(PROV_PTR_CACHE, "w"))
         except Exception:
             pass
+    _MEM[key] = out
     return out
+
+
+_CAP_PROV_CACHE = {}
+
+
+def capital_provinces(g):
+    """province_id -> tag for every country's capital state (cached per pid).
+
+    `CCountry+0xFF0` is a STATE id (verified: GER -> 64 -> Berlin 9496). The
+    capital state's provinces come from the static state table, so no per-country
+    CO_STATES walk is needed and two countries can never claim the same capital.
+    """
+    key = getattr(g.p, "pid", None)
+    if key in _CAP_PROV_CACHE:
+        return _CAP_PROV_CACHE[key]
+    out = {}
+    try:
+        g._load_tags()
+        ptrs = g.country_ptrs()
+        st2p, _ = load_state_provinces()
+        state_tag = {}
+        for tid, tag in enumerate(g._tags):
+            if not tag or tag == "---":
+                continue
+            try:
+                ci = g._tag2idx[tid]
+                if not (0 <= ci < len(ptrs)):
+                    continue
+                sid = int(g.p.i32(ptrs[ci] + 0xFF0))
+                if sid > 0:
+                    state_tag.setdefault(sid, tag)
+            except Exception:
+                continue
+        for sid, tag in state_tag.items():
+            for q in st2p.get(sid, ()):
+                out[q] = tag
+    except Exception:
+        out = {}
+    _CAP_PROV_CACHE[key] = out
+    return out
+
+
+def province_controller_map(g, divisions=None):
+    """province_id -> controller tag, LIVE (civil-war occupation included).
+
+    The old province_owner_map() derives the tag from each country's CO_STATES
+    list, i.e. *state ownership*. In a civil war (and any war before a peace
+    treaty) occupied provinces only change their controller; ownership stays with
+    the original country, so front_changes reported 0 while a state was lost.
+
+    Controller resolution:
+      1. Every CProvince has a CControllerArea pointer at +0xF0. All provinces
+         controlled by the same country share one area object.
+      2. T5 (review 2026-11-07): the area's tag is anchored on the CAPITAL
+         province first. A raw majority vote of the owners flipped an area that
+         contained more occupied enemy provinces than homeland provinces (East
+         Prussia with 16 Polish provinces vs 15 German ones was reported as
+         "POL"), which made our own ground look like enemy territory. Only when
+         no capital is inside the area do we fall back to the owner vote.
+      3. `area == 0` (sea / uninitialised) no longer forms one giant bucket that
+         voted for itself; those provinces keep their state owner.
+      4. Optional `divisions` overlay: a province with divisions of exactly one
+         tag present is forced to that tag (handles freshly occupied ground
+         before the area pointer updates).
+    """
+    from collections import Counter
+    owners, _ = province_owner_map(g)
+    ptrs = province_objects(g)
+    caps = capital_provinces(g)
+    groups = {}
+    for pid, pr in ptrs.items():
+        try:
+            area = g.p.u64(pr + 0xF0)
+        except OSError:
+            area = 0
+        if not area:
+            continue
+        groups.setdefault(area, []).append(pid)
+    byid = {}
+    for area, pids in groups.items():
+        cap_hits = Counter(caps[x] for x in pids
+                           if caps.get(x) and owners.get(x) == caps[x])
+        if len(cap_hits) == 1:
+            tag = next(iter(cap_hits))
+        else:
+            c = Counter(owners.get(x) for x in pids
+                        if owners.get(x) not in (None, "---"))
+            tag = c.most_common(1)[0][0] if c else None
+        for pid in pids:
+            byid[pid] = tag or owners.get(pid)
+    # Any province missing from the CProvince scan keeps its state owner.
+    for pid, t in owners.items():
+        byid.setdefault(pid, t)
+    if divisions:
+        seen = {}
+        for r in divisions:
+            pv, tag = r.get("prov"), r.get("tag")
+            if pv is not None and tag:
+                seen.setdefault(pv, set()).add(tag)
+        for pv, tags in seen.items():
+            if len(tags) == 1:
+                byid[pv] = next(iter(tags))
+    return byid
 
 
 def border_provinces(g, own_tag, enemy_tag, owner_by_id=None, adj=None):
     """Land provinces of own_tag that border enemy_tag, as a list of ids."""
     if owner_by_id is None:
-        owner_by_id, _ = province_owner_map(g)
+        owner_by_id = province_controller_map(g)
     if adj is None:
         adj = build_adjacency()
     _, ptype = load_definitions()
