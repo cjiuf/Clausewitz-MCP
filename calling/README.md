@@ -35,11 +35,14 @@ orders inside a single attach.
 |---|---|
 | `config.py` | path and platform resolution, the only place that knows about install locations |
 | `process/linux.py` | raw read/write and the ptrace call machinery |
+| `process/windows.py`, `process/winject.py` | `ReadProcessMemory`/`WriteProcessMemory` and the thread-hijack call path |
+| `offsets.py`, `offsets_win.py` | the offset tables, one file per build; `offsets.py` picks one for the platform |
 | `mem.py`, `call.py` | portable wrappers over the backend: typed reads, string decoding, scanning |
 | `api.py` | the `HOI4` handle: countries, dates, modifiers, console, the verified-call guard |
 | `game.py` | the macro model: focus, research, production, construction, politics, armies |
 | `commands.py` | building and posting player commands, all 358 of them |
-| `objindex.py`, `rtti.py`, `fieldmap.py` | class discovery: RTTI walk, plus field names pulled from the game's serializers |
+| `pecmd.py`, `cmdwin.py` | Windows command layer: recover every `C*Command` constructor from the PE, then build and post through it |
+| `objindex.py`, `rtti.py`, `rtti_win.py`, `fieldmap.py` | class discovery: RTTI walk (Itanium and MSVC), plus field names pulled from the game's serializers |
 | `mapdata.py` | province graph, terrain, river crossings, state to province map |
 | `combat.py` | battles read from the game's own damage output |
 | `doctrine.py` | tactical constants and the encirclement search |
@@ -66,8 +69,11 @@ python3 clausewitz.py tables
 | `terrain.txt` | terrain, stacking, river, fort, entrenchment and supply constants |
 | `tools.txt` | the MCP tool list |
 
-These are for **Hearts of Iron IV 1.19.2, Linux build**. After a patch, regenerate them
-with the scanners in [`../research/`](../research/).
+These are generated from the source tree and are **build-specific**: the numbers in them
+are for Hearts of Iron IV **1.19.2 / 1.19.4.1.99a5 on Linux** and **1.19.5.0 on Windows**
+(the Windows values live in `offsets_win.py` and `pecmds.pkl`, which `_generate.py`
+regenerates from `hoi4.exe`). After a patch, regenerate them with the scanners in
+[`../research/`](../research/).
 
 ## Caches
 

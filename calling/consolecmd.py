@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Direct, in-process console commands for HOI4 1.19.4.1 (2026-11-10).
+"""Direct, in-process console commands for HOI4 1.19.4.1 (Linux) / 1.19.5.0 (Windows).
 
 The keyboard path (`xconsole.py`) works, but it needs a live window manager, a
 live console command table inside the running game and a working X server. This
 module removes all three: it finds the engine's own command table in memory and
 calls each command's handler directly.
 
-Layout of one table entry (stride 0x1C8, measured on 1.19.4.1):
+Both builds share the entry layout (stride 0x1C8); only *where* the table lives
+and *how* the argument array is built differ:
+
+    Linux   table found by scanning writable memory for `manpower`
+            args built with operator new, libstdc++ basic_string layout
+    Windows table read from G_CONSOLE_MANAGER (an inline CPdxArray, 370/514)
+            args built inside the injector's own scratch page, MSVC std::string
+
+Layout of one table entry (stride 0x1C8, measured on 1.19.4.1 and 1.19.5.0):
 
     +0x08  std::string  command name (SSO for short names, hence the bytes live
                         at +0x18 and the object is at +0x08)
@@ -36,15 +44,21 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 
 STRIDE = 0x1C8
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "console_table.json")
-ALLOC_OFF = 0x4505128          # CPdxNewDeleteAllocator (type-erased allocator)
+ALLOC_OFF = 0x4505128          # CPdxNewDeleteAllocator (Linux, type-erased)
+
+_WIN = sys.platform == "win32"
+WIN_TEXT_LO, WIN_TEXT_SPAN = 0x1000, 0x3900000   # whole .text of hoi4.exe 1.19.5.0
 
 _cache = {"pid": None, "base": 0, "count": 0}
 
 
 def _text_range(g):
+    if _WIN:
+        return g.base + WIN_TEXT_LO, g.base + WIN_TEXT_SPAN
     return g.base + 0x5111C0, g.base + 0x367DAC0
 
 
@@ -100,12 +114,46 @@ def _scan_for_entry(g, needle="manpower"):
     return hits[0] if hits else 0
 
 
+def _win_table(g):
+    """(base, count) from G_CONSOLE_MANAGER, or (0, 0) if that global is not one.
+
+    1.19.5.0 keeps the array **inline** in .data (not a pointer to a manager
+    object), so this is an O(1) lookup:  {void* data; i32 cap; i32 size; alloc*}
+    """
+    p = g.p
+    try:
+        from offsets import G_CONSOLE_MANAGER, PDXARRAY_DATA, PDXARRAY_SIZE
+        a = g.va(G_CONSOLE_MANAGER)
+        raw = p.read(a, 0x18)
+        base = struct.unpack_from("<Q", raw, PDXARRAY_DATA)[0]
+        cap = struct.unpack_from("<i", raw, 0x08)[0]
+        size = struct.unpack_from("<i", raw, PDXARRAY_SIZE)[0]
+    except Exception:
+        return 0, 0
+    if not base or not (0 < size <= 4096) or cap < size:
+        return 0, 0
+    if not _looks_like_entry(g, base):
+        return 0, 0
+    # walk the array rather than trusting `size`: a table rebuilt mid-load can
+    # announce 370 while only N entries are populated.
+    count, cur = 0, base
+    while count < size and _looks_like_entry(g, cur):
+        count += 1
+        cur += STRIDE
+    return base, count
+
+
 def table(g):
     """(base, count) of the console command table for this process."""
     global _cache
     p = g.p
     if _cache["pid"] == p.pid and _cache["base"]:
         return _cache["base"], _cache["count"]
+    if _WIN:
+        base, count = _win_table(g)
+        if base:
+            _cache = {"pid": p.pid, "base": base, "count": count}
+            return base, count
     try:
         d = json.load(open(CACHE))
         if d.get("pid") == p.pid and d.get("base"):
@@ -135,14 +183,19 @@ def table(g):
     return start, count
 
 
-def find(g, name):
+def _index(g):
+    """{name_or_alias: entry_addr} for this process (cached by pid+table)."""
     base, count = table(g)
+    key = (g.p.pid, base, count)
+    if _index.cache and _index.cache[0] == key:
+        return _index.cache[1]
     p = g.p
+    idx = {}
     for i in range(count):
         e = base + i * STRIDE
-        if _looks_like_entry(g, e) == name:
-            return e
-    # aliases: entry+0x30 holds char* aliases
+        nm = _looks_like_entry(g, e)
+        if nm:
+            idx.setdefault(nm, e)
     for i in range(count):
         e = base + i * STRIDE
         try:
@@ -151,22 +204,47 @@ def find(g, name):
                 continue
             for k in range(na):
                 ap = p.u64(e + 0x30 + k * 8)
-                if ap and p.cstr(ap, 48) == name:
-                    return e
+                if ap:
+                    s = p.cstr(ap, 48)
+                    if s:
+                        idx.setdefault(s, e)
         except Exception:
             continue
-    return 0
+    _index.cache = (key, idx)
+    return idx
+
+
+_index.cache = None
+
+
+def find(g, name):
+    return _index(g).get(name, 0)
 
 
 def commands(g):
+    """{name: {func, entry, aliases}} from the engine's own table."""
     base, count = table(g)
     out = {}
     p = g.p
     for i in range(count):
         e = base + i * STRIDE
         nm = _looks_like_entry(g, e)
-        if nm:
-            out[nm] = {"func": "img+%#x" % (p.u64(e + 0x68) - g.base), "entry": hex(e)}
+        if not nm:
+            continue
+        aliases = []
+        try:
+            na = p.i32(e + 0x28)
+            if 0 < na <= 8:
+                for k in range(na):
+                    ap = p.u64(e + 0x30 + k * 8)
+                    if ap:
+                        s = p.cstr(ap, 48)
+                        if s:
+                            aliases.append(s)
+        except Exception:
+            pass
+        out[nm] = {"func": "img+%#x" % (p.u64(e + 0x68) - g.base),
+                   "entry": hex(e), "aliases": aliases}
     return out
 
 
@@ -199,6 +277,33 @@ def _mkargs(g, args):
     return hdr
 
 
+def _run_win(g, entry, args):
+    """Call one handler on Windows through the thread-hijack injector.
+
+    The argument array is built inside the injector's own scratch page, so no
+    operator new and no per-argument heap blocks: nothing to leak, nothing to
+    smash.  `CString` here is MSVC std::string, not libstdc++.
+    """
+    p = g.p
+    if getattr(g, "read_only", False):
+        raise RuntimeError(
+            "READ-ONLY mode is on: refusing to call a console handler.")
+    from offsets import G_DEFAULT_ALLOC
+    fn = p.u64(entry + 0x68)
+    lo, hi = _text_range(g)
+    if not (lo <= fn < hi):
+        raise RuntimeError("handler %#x of %r is outside the image"
+                           % (fn, p.stdstring(entry + 0x08)))
+    own = g._inj is None
+    if own:
+        g.attach()
+    try:
+        return g._inj.run_console_cmd(fn, args, g.base + G_DEFAULT_ALLOC)
+    finally:
+        if own:
+            g.detach()
+
+
 def run(g, line):
     """Execute one console command line. Returns (ok, message)."""
     import api
@@ -219,6 +324,8 @@ def run(g, line):
         e = find(g, name)
         if not e:
             return False, "unknown command: %s" % name
+    if _WIN:
+        return _run_win(g, e, args)
     p = g.p
     fn = p.u64(e + 0x68) - g.base
     api.allow_call(fn)

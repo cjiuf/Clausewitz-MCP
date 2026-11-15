@@ -67,8 +67,8 @@ def cmd_doctor(args):
         print("  running game   : could not check (%s)" % e)
 
     if platform.system() == "Windows":
-        print("\n  NOTE: Clausewitz-MCP is Linux-only for now. See the roadmap in")
-        print("        README.md for what the Windows port needs.")
+        import offsets_win
+        print("  windows table  : %s  (%s)" % (offsets_win.VERSION, offsets_win.BUILD_ID))
     print("-" * 52)
     print("RESULT: %s" % ("ready" if ok else "problems found"))
     return 0 if ok else 1

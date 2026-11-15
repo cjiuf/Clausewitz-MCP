@@ -141,7 +141,17 @@ def og_info(g, og):
 
 # ------------------------------------------------------------------ actions
 def create_army(g, divisions, theatre=None):
-    """Collect the given divisions (CArmy*) into a new army."""
+    """Collect the given divisions (CArmy*) into a new army.
+
+    Windows takes a different route: the PE build's COrderGroupCommand ctor wants
+    a parent COrdersGroup, not a CTheatre, and the command's own Execute body is
+    0x00C417A0 (theatre + handle array -> COrdersGroup*). Call that directly --
+    see armyops_win for the disassembly it came from.
+    """
+    import sys
+    if sys.platform == "win32":
+        import armyops_win
+        return armyops_win.create_army(g, divisions)
     from game import _arr
     if theatre is None:
         theatre = _arr(g.p, g.player().ptr, 0x168)[0]

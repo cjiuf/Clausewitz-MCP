@@ -17,9 +17,18 @@ entrenchment and supply are all already accounted for.
                    +0x498 days out of supply  +0x1D8 country  +0x3D0 manpower
 """
 import struct
+import sys
 
-G_GAMESTATE = 0x459E9F0   # 1.19.4.1 (was 0x43F2648)
-GS_COMBATS  = 0x268
+try:
+    import offsets as O
+except Exception:                      # direct script use
+    O = None
+
+# BUG-18 (playtest 2026-11-15): this was the ELF constant, so every read on
+# hoi4.exe went to an unmapped address (`OSError [Errno 299] read ...+8`).
+# `offsets.py` already resolves to the Windows table on win32.
+G_GAMESTATE = getattr(O, "G_GAMESTATE", None) or 0x459E9F0
+GS_COMBATS = getattr(O, "GS_COMBATS", None) or 0x268
 
 LC_SIDE_A, LC_SIDE_B = 0x28, 0x30
 LC_PROVINCE, LC_TERRAIN = 0x38, 0x48
@@ -76,6 +85,18 @@ def combats(g, only_mine=True):
     from game import _arr
     p = g.p
     gs = p.u64(p.base + G_GAMESTATE)
+    if sys.platform == "win32":
+        # `GS_COMBATS` is still a Linux-derived guess on the PE build.  Only
+        # believe it when the CPdxArray header at that offset is coherent;
+        # otherwise report "no battles" instead of walking a bogus array.
+        try:
+            data = p.u64(gs + GS_COMBATS)
+            cap = p.i32(gs + GS_COMBATS + 8)
+            size = p.i32(gs + GS_COMBATS + 12)
+            if not (0 <= size <= cap <= 4096) or (size and not data):
+                return []
+        except Exception:
+            return []
     me = g.player_tag()
     tagof = {}
     for t in g.tags():
@@ -262,10 +283,61 @@ def _country_id_map(g):
     return out
 
 
-def war_relations(g, tag=None):
+# CWarRelation on the 1.19.5 PE build (vtable 0x29DCC08, sizeof 0x1D0).
+# Verified live on both wars present in a 1936 save: an Italy/Ethiopia war read
+# (16, 44) and a fresh German/Dominican war read (1, 73), with the second copy of
+# the pair at +0x78/+0x7C agreeing on both.
+WR_WIN_VTABLE = 0x29DCC08
+WR_WIN_A, WR_WIN_B = 0x78, 0x7C
+WR_WIN_A2, WR_WIN_B2 = 0x10, 0x14
+
+
+def _war_relations_win(g, me_tag, refresh=False):
+    """Windows: read the war table by scanning live CWarRelation objects.
+
+    The object index is a memory snapshot, so it cannot see a war declared after
+    it was built -- callers that just declared one must pass `refresh=True`
+    (a full rescan costs ~25 s).
+    """
+    p = g.p
+    oi = g.oi
+    oi.build(force=refresh)
+    try:
+        me_id = p.i32(g.country(me_tag).ptr + 8)
+    except Exception:
+        return []
+    id2tag = _country_id_map(g)
+    out = []
+    for a in oi.instances("CWarRelation"):
+        try:
+            atk = p.i32(a + WR_WIN_A) or p.i32(a + WR_WIN_A2)
+            dfd = p.i32(a + WR_WIN_B) or p.i32(a + WR_WIN_B2)
+        except Exception:
+            continue
+        if not atk or not dfd or atk == dfd:
+            continue
+        if atk == me_id:
+            enemy_id = dfd
+        elif dfd == me_id:
+            enemy_id = atk
+        else:
+            continue
+        enemy = id2tag.get(enemy_id)
+        if not enemy or enemy == me_tag:
+            continue
+        out.append({"enemy": enemy, "me": me_tag, "threat": None, "_ptr": a})
+    return out
+
+
+def war_relations(g, tag=None, refresh=False):
     """Wars the country is IN: PURE READS, no injected calls.
 
-    CCountry+0xF60 (CDiplomacyStatus) +0x20 -> array of CWarRelation*.
+    On Windows this scans live `CWarRelation` objects (see `_war_relations_win`);
+    `refresh=True` forces the object index to be rebuilt, which is required to
+    see a war declared since the last scan.
+
+    On the ELF build: CCountry+0xF60 (CDiplomacyStatus) +0x20 -> array of
+    CWarRelation*.
 
     The enemy is NOT read from an offset. The side fields inside CWarRelation mix
     two different id spaces (a CCountry+0x08 id in one place, an index into the
@@ -280,6 +352,8 @@ def war_relations(g, tag=None):
     from game import _arr
     p = g.p
     me_tag = tag or g.player_tag()
+    if sys.platform == "win32":
+        return _war_relations_win(g, me_tag, refresh=refresh)
     try:
         c = g.country(me_tag)
         mine = _arr(p, p.u64(c.ptr + CO_DIPLOMACY_STATUS), DS_WAR_RELATIONS)
@@ -474,6 +548,6 @@ def at_war(g, tag=None):
         return False
 
 
-def enemy_tags(g, tag=None):
+def enemy_tags(g, tag=None, refresh=False):
     """Tags of the countries we are at war with: pure reads."""
-    return sorted({w["enemy"] for w in war_relations(g, tag)})
+    return sorted({w["enemy"] for w in war_relations(g, tag, refresh=refresh)})

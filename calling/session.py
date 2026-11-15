@@ -6,12 +6,23 @@ player's own command channel: the same path as pressing space, subject to whatev
 rules the multiplayer session enforces.
 """
 import struct
+import sys as _sys
 
 # 1.19.4.1 (f584) globals. These used to be the 1.19.2 addresses, which made
 # is_paused() read a random byte (0xF4 -> always "paused") and date_raw() never
 # self-heal. Keep them in one place; commands.py uses IDLER_GLOBAL = 0x459E908.
 G_IDLER      = 0x459E908
 G_GAMESTATE  = 0x459E9F0
+# The PE build is a different binary: reading the ELF offsets there fails outright
+# (`ReadProcessMemory ... GetLastError=299`) and that made hoi4_pause / hoi4_resume
+# throw on Windows.  Take the verified 1.19.5.0 values when they exist.
+if _sys.platform == "win32":
+    try:
+        import offsets_win as _OW
+        G_IDLER = getattr(_OW, "G_IDLER", G_IDLER)
+        G_GAMESTATE = getattr(_OW, "G_GAMESTATE", G_GAMESTATE)
+    except ImportError:
+        pass
 IDLER_COUNTRY_NAME = 0x620    # std::string, name of the played country
 IDLER_LOCAL_PLAYER = 0x7C0    # std::string, local player name
 SESSION_NET  = 0x58           # CSession+0x58 -> network object (CProxyServer)
@@ -144,6 +155,26 @@ def pause(g, paused=True, who=None):
     """
     want = bool(paused)
     import time as _t
+
+    if _sys.platform == "win32":
+        # The command path below builds CPauseGame from the ELF vtable (0x4460D70),
+        # which is not a function in hoi4.exe -- building it there is a good way to
+        # lose the process.  On the PE build the state lives in idler+0x6C1, so write
+        # that and read it back.  Caveat: the byte is necessary but not sufficient --
+        # a World-News popup or a minimised window stops the clock while +0x6C1
+        # still reads 0, so the caller must confirm with the on-screen date.
+        p = g.p
+        idler = p.u64(p.base + G_IDLER)
+        if not idler:
+            return False, "no idler (still on the menu?)"
+        if bool(p.u8(idler + IDLER_PAUSED)) == want:
+            return True, "already %s" % ("paused" if want else "running")
+        p.write(idler + IDLER_PAUSED, b"\x01" if want else b"\x00")
+        _t.sleep(0.3)
+        got = bool(p.u8(idler + IDLER_PAUSED))
+        if got != want:
+            return False, "wrote idler+0x6C1 but it reads %s" % got
+        return True, "idler+0x6C1 -> %d (hoi4.exe: no CPauseGame path)" % int(want)
 
     def running_proof():
         """The clock moved -> really running (the pause flag alone lies at start)."""

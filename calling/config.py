@@ -104,6 +104,33 @@ def binary_path(required=True):
     return None
 
 
+def user_dir():
+    """The game's user directory (saves, logs, mod config) for this platform.
+
+    Linux keeps it under ~/.local/share; Windows under Documents. The old
+    log/save lookups hardcoded the XDG path, which simply does not exist on a
+    Windows install, so every "is this CDate plausible" check was blind and the
+    date reader happily returned a frozen 1945 copy inside a 1936 campaign.
+    """
+    env = os.environ.get("HOI4_USERDIR")
+    if env and os.path.isdir(env):
+        return env
+    home = os.path.expanduser("~")
+    if WINDOWS:
+        cands = [os.path.join(home, "Documents", "Paradox Interactive", "Hearts of Iron IV"),
+                 os.path.join(home, "OneDrive", "Documents", "Paradox Interactive",
+                              "Hearts of Iron IV"),
+                 os.path.join(home, "Documents", "Paradox Interactive", "Hearts of Iron IV",
+                              "logs")]
+    else:
+        cands = [os.path.join(home, ".local", "share", "Paradox Interactive",
+                              "Hearts of Iron IV")]
+    for d in cands:
+        if os.path.isdir(d):
+            return d
+    return cands[0]
+
+
 def cache(name):
     return os.path.join(CACHE_DIR, name)
 

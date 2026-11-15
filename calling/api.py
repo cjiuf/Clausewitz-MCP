@@ -9,7 +9,7 @@ Two capabilities:
 Reverse-engineering notes are in research/FINDINGS.md; offsets in offsets.py.
 """
 from __future__ import annotations
-import json, os, re, struct, time
+import json, os, re, struct, sys, time
 from typing import Iterable, Optional
 
 from mem import Proc
@@ -73,14 +73,97 @@ class Country:
     # ---- industry ----
     @property
     def military_factories(self) -> int:
+        if sys.platform == "win32":
+            return self._win_building_counts()[1]
         return _sdiv(self.game.p.i64(self.economy + O.EC_MIL_FACTORIES), O.FIXED)
 
     @property
     def naval_dockyards(self) -> int:
+        if sys.platform == "win32":
+            return self._win_building_counts()[2]
         return _sdiv(self.game.p.i64(self.economy + O.EC_NAVAL_DOCKYARDS), O.FIXED)
+
+    # ---- factories (Windows): sum building levels over the owned states ----
+    # CBuilding type ids are stable in 1.19.5.0 and were verified by summing the
+    # same states the UI counts (GER 35+28+10 = the 73 on the top bar; BEL 11+6+0,
+    # HOL 11+4+3, LUX 3+1+0, FRA 35+8+11, ENG 32+14+19 all agree).
+    BLD_CIV, BLD_MIL, BLD_DOCK = 20013, 20002, 19446
+
+    def _win_building_counts(self):
+        p = self.game.p
+        d = p.u64(self.ptr + 0x460)
+        n = p.i32(self.ptr + 0x46C)
+        civ = mil = dock = 0
+        if d and 0 < n < 2000:
+            for s in struct.unpack("<%dQ" % n, p.read(d, 8 * n)):
+                dd = p.u64(s + 0x158)
+                nn = p.i32(s + 0x164)
+                if not dd or not (0 < nn < 400):
+                    continue
+                for b in struct.unpack("<%dQ" % nn, p.read(dd, 8 * nn)):
+                    try:
+                        tid = p.i32(b + 0x08)
+                        lvl = struct.unpack("<h", p.read(b + 0x40, 2))[0]
+                    except OSError:
+                        continue
+                    if tid == self.BLD_CIV:
+                        civ += lvl
+                    elif tid == self.BLD_MIL:
+                        mil += lvl
+                    elif tid == self.BLD_DOCK:
+                        dock += lvl
+        return civ, mil, dock
+
+    # ---- manpower (Windows) ----
+    # Every CState carries an embedded CStateManpower at +0x830:
+    #
+    #     +0x18  int32   manpower AVAILABLE from this state  (the UI's number)
+    #     +0x1C  int32   population that cannot be recruited ("locked")
+    #     +0x20  int32   population of the state
+    #
+    # Summing over the owned states reproduces the campaign autosave exactly:
+    # HOL 23 857, BEL 9 542, LUX 4 432 (no drift, no army) and GER/FRA/ENG/SOV
+    # within the recruitment that happened after the save was written.
+    # `total` = sum of (population - locked) is the manpower before what the
+    # army/air force/navy already uses; `used` is their difference.
+    #
+    # CCountry+0x328 is the embedded CCountryManpower; +0x10 is the recruitment
+    # ratio in fixed(1e5) (GER 2.5%, LUX 1.5%) and cross-checks the total, but
+    # its +0x20 counter is NOT the used manpower (GER 330 450 vs 323 550 here),
+    # so it is not used for the arithmetic.
+    MP_OBJ = 0x328                   # CCountryManpower inside CCountry
+    MP_RATIO = 0x10                  # int64 fixed(1e5)
+    SM_OBJ = 0x830                   # CStateManpower inside CState
+    SM_AVAILABLE = 0x18              # int32
+    SM_LOCKED = 0x1C                 # int32 unrecruitable part
+    SM_TOTAL = 0x20                  # int32 population
+
+    def _win_manpower_parts(self):
+        """(available, total, used, population)."""
+        p = self.game.p
+        d = p.u64(self.ptr + 0x460)
+        n = p.i32(self.ptr + 0x46C)
+        population = recruitable = available = 0
+        if d and 0 < n < 2000:
+            for s in struct.unpack("<%dQ" % n, p.read(d, 8 * n)):
+                try:
+                    tot = p.i32(s + self.SM_OBJ + self.SM_TOTAL)
+                    locked = p.i32(s + self.SM_OBJ + self.SM_LOCKED)
+                    avail = p.i32(s + self.SM_OBJ + self.SM_AVAILABLE)
+                except OSError:
+                    continue
+                population += tot
+                recruitable += tot - locked
+                available += avail
+        return available, recruitable, recruitable - available, population
+
+    def _win_manpower(self):
+        return self._win_manpower_parts()[0]
 
     @property
     def civilian_factories(self) -> int:
+        if sys.platform == "win32":
+            return self._win_building_counts()[0]
         e = self.economy
         total = _sdiv(self.game.p.i64(e + O.EC_CIV_FACTORIES), O.FIXED)
         return total - (self.game.p.i32(e + O.EC_CIV_RESERVED_A)
@@ -97,6 +180,10 @@ class Country:
 
     @property
     def ruling_party_popularity(self) -> float:
+        if sys.platform == "win32":
+            # CPoliticalStatus+0xD0 is not a pointer on this build (+0x13, +0x1f
+            # are small ints), so the Linux path cannot be used.  Unknown, not 0.
+            return None
         sub = self.game.p.u64(self.politics + O.PO_RULING_SUB)
         return self.game.p.i64(sub + 0x88) / (O.FIXED * 100)
 
@@ -111,12 +198,23 @@ class Country:
     # ---- by calling the game's own functions (exact values) ----
     def stability(self) -> float:
         # 1.19.4: 引擎函数地址不可用，退回基础值（不含修正）
+        if sys.platform == "win32":
+            # base + every active `stability_factor`.  The UI adds one more term
+            # that is not in the modifier list -- the stability tooltip calls it
+            # "执政党支持率" (+6.00% for GER) and derives it from the ruling
+            # party's popularity, which is not located yet.  So this is the
+            # value before that term; GER reads 0.75 here and 81% in the UI.
+            return self.stability_base + self._win_modifier_value("stability_factor")
         return self.stability_base
 
     def war_support(self) -> float:
+        if sys.platform == "win32":
+            return self.war_support_base + self._win_modifier_value("war_support_factor")
         return self.war_support_base
 
     def manpower(self):
+        if sys.platform == "win32":
+            return self._win_manpower()
         # 1.19.4: 直读字段（引擎函数地址已失效）
         # +0x23F0 only behaves for the country whose UI is being drawn. On an AI
         # country the same slot can hold a heap pointer (measured HOL:
@@ -125,6 +223,24 @@ class Country:
         v = self.game.p.i64(self.ptr + O.CO_MANPOWER_CUR)
         if -1 <= v <= 500_000_000:
             return int(v)
+        return None
+
+    @property
+    def manpower_total(self):
+        """Manpower before subtracting what the army/air force/navy already use.
+
+        Windows only: the Linux build keeps it behind an engine call that is not
+        located yet, so `None` there means unknown -- not zero.
+        """
+        if sys.platform == "win32":
+            return self._win_manpower_parts()[1]
+        return None
+
+    @property
+    def population(self):
+        """Sum of the owned states' population (Windows only, None elsewhere)."""
+        if sys.platform == "win32":
+            return self._win_manpower_parts()[3]
         return None
 
     # ---- identity ----
@@ -148,8 +264,21 @@ class Country:
 
     @property
     def fuel(self) -> float:
+        if sys.platform == "win32":
+            # CCountryFuelStatus (+0x1580): +0x08 current, +0x10 capacity, both
+            # fixed(1e5). GER 100.7K/121.7K, FRA 31.0K/95.8K, ENG 0/107.3K,
+            # SOV 67.7K/183.5K, HOL 20.0K/41.3K -- current never exceeds capacity.
+            o = self.game.p.u64(self.ptr + O.CO_FUEL_STATUS)
+            return self.game.p.i64(o + 0x08) / O.FIXED if o else 0.0
         o = self.game.p.u64(self.ptr + O.CO_FUEL)
         return self.game.p.i64(o + 0x8) / O.FIXED if o else 0.0
+
+    @property
+    def fuel_capacity(self):
+        if sys.platform == "win32":
+            o = self.game.p.u64(self.ptr + O.CO_FUEL_STATUS)
+            return self.game.p.i64(o + 0x10) / O.FIXED if o else 0.0
+        return None
 
     @property
     def state_count(self) -> int:
@@ -163,14 +292,62 @@ class Country:
         return list(struct.unpack("<%dQ" % n, self.game.p.read(base, 8 * n)))
 
     # ---- modifier'lar ----
+    # Windows: CCountry+0x5D0 and +0x5E8 are CPdxArray<CModifier*>.  A CModifier
+    # is a small polymorphic object whose +0x10 points at an array of
+    # {int32 id; 4 pad; int64 value} pairs, count at +0x18 (value = fixed 1e5).
+    # The Linux build keeps one flat sorted array at CO_MODIFIERS instead, which
+    # is why the old code read pointer fragments here.
+    #
+    # Verified against the stability tooltip: the sum of `stability_factor` is
+    # exactly the "帝国议会 +5.00%" line and `war_support_factor` gives GER
+    # 0.30 + 0.05 = 0.35, the 35% on the top bar.
+    CM_ARRAYS = (0x5D0, 0x5E8)
+    CM_PAIRS = 0x10
+    CM_COUNT = 0x18
+
+    def _win_modifier_totals(self):
+        p = self.game.p
+        tot = {}
+        for base in self.CM_ARRAYS:
+            d = p.u64(self.ptr + base)
+            n = p.i32(self.ptr + base + 0x0C)
+            if not d or not (0 < n < 2000):
+                continue
+            for k in range(n):
+                cm = p.u64(d + 8 * k)
+                if not cm:
+                    continue
+                arr = p.u64(cm + self.CM_PAIRS)
+                cnt = p.i32(cm + self.CM_COUNT)
+                if not arr or not (0 < cnt < 1000):
+                    continue
+                raw = p.try_read(arr, 16 * cnt)
+                if not raw:
+                    continue
+                for i in range(cnt):
+                    mid, val = struct.unpack_from("<i4xq", raw, i * 16)
+                    tot[mid] = tot.get(mid, 0) + val
+        return tot
+
+    def _win_modifier_value(self, name) -> float:
+        mid = self.game.modifier_id(name)
+        if mid is None:
+            return 0.0
+        return self._win_modifier_totals().get(mid, 0) / O.FIXED
+
     def modifier(self, name_or_id) -> float:
         mid = self.game.modifier_id(name_or_id) if isinstance(name_or_id, str) else int(name_or_id)
         if mid is None:
             raise KeyError("bilinmeyen modifier: %r" % (name_or_id,))
+        if sys.platform == "win32":
+            return self._win_modifier_totals().get(mid, 0) / O.FIXED
         return self.game.read_modifier(self.ptr + O.CO_MODIFIERS, mid) / O.FIXED
 
     def modifiers(self) -> dict:
         """Every modifier active on this country, as {name: value}."""
+        if sys.platform == "win32":
+            return {self.game.modifier_name(mid) or ("modifier_%d" % mid): v / O.FIXED
+                    for mid, v in self._win_modifier_totals().items()}
         c = self.ptr + O.CO_MODIFIERS
         data = self.game.p.u64(c + O.PDXARRAY_DATA)
         n = self.game.p.i32(c + O.PDXARRAY_SIZE)
@@ -184,6 +361,8 @@ class Country:
         return out
 
     def summary(self) -> dict:
+        def rnd(v, n=4):
+            return round(v, n) if isinstance(v, (int, float)) else None
         return {
             "tag": self.tag,
             "name": self.name,
@@ -192,13 +371,13 @@ class Country:
             "military_factories": self.military_factories,
             "naval_dockyards": self.naval_dockyards,
             "political_power": self.political_power,
-            "stability": round(self.stability(), 4),
-            "war_support": round(self.war_support(), 4),
+            "stability": rnd(self.stability()),
+            "war_support": rnd(self.war_support()),
             "manpower": self.manpower(),
-            "fuel": round(self.fuel, 2),
+            "fuel": rnd(self.fuel, 2),
             "nukes": self.nukes,
             "states": self.state_count,
-            "ruling_party_popularity": round(self.ruling_party_popularity, 4),
+            "ruling_party_popularity": rnd(self.ruling_party_popularity),
         }
 
     def __repr__(self):
@@ -338,26 +517,26 @@ class HOI4:
         """Attach once when making several calls; much faster than attaching per call.
 
         2026-11-08 (run 20): every process that injects now takes an exclusive
-        `flock` on /tmp/hoi4_ptrace.lock first. The gateway runs a front_worker
+        cross-process lock (xlock.FileLock: flock on POSIX, msvcrt on Windows)
+        on hoi4_ptrace.lock first. The gateway runs a front_worker
         thread that calls `hoi4_tactical_front_tick` every 8 s, and the model (or a
         stage/ script) can attach at the same moment: two PTRACE_SEIZE +
         register rewrites on the same main thread garble RIP/RSP and kill the
         process. The kernel serialises them instead.
         """
         if self._depth == 0:
-            import fcntl
-            self._lock_fh = open("/tmp/hoi4_ptrace.lock", "w")
-            fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_EX)
+            from xlock import FileLock
+            self._lock = FileLock()
+            self._lock.acquire()
             try:
                 self._inj = Injector(self.p)
                 self._inj.attach()
             except Exception:
                 try:
-                    fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
-                    self._lock_fh.close()
+                    self._lock.release()
                 except Exception:
                     pass
-                self._lock_fh = None
+                self._lock = None
                 raise
         self._depth += 1
         return self
@@ -369,15 +548,13 @@ class HOI4:
                 if self._inj:
                     self._inj.detach(); self._inj = None
             finally:
-                fh = getattr(self, "_lock_fh", None)
-                if fh is not None:
+                lk = getattr(self, "_lock", None)
+                if lk is not None:
                     try:
-                        import fcntl
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-                        fh.close()
+                        lk.release()
                     except Exception:
                         pass
-                    self._lock_fh = None
+                    self._lock = None
 
     def call(self, func_vaddr: int, args: Iterable[int] = (), signed=False,
              scratch_writer=None, absolute=False, force=False):
@@ -416,9 +593,23 @@ class HOI4:
                 self.detach()
 
     def malloc(self, size: int) -> int:
+        """Scratch memory the game itself can read.
+
+        On the PE build `O.FN_OPERATOR_NEW` is None (the CRT `operator new` was
+        never located) and calling the CRT allocator from a hijacked thread takes
+        the process down (cmdwin §25).  Everything that needs a scratch buffer --
+        command ctors, `_i32buf`, error sinks -- therefore goes through the game's
+        own `CPdxNewDeleteAllocator` singleton, which is what `cmdwin.alloc` wraps.
+        """
+        if sys.platform == "win32":
+            import cmdwin
+            return cmdwin.alloc(self, int(size))
         return self.call(O.FN_OPERATOR_NEW, (size,))
 
     def free(self, ptr: int):
+        if sys.platform == "win32":
+            import cmdwin
+            return cmdwin.free(self, int(ptr))
         self.call(O.FN_OPERATOR_DELETE, (ptr,))
 
     # =============================================== console commands
@@ -489,13 +680,23 @@ class HOI4:
             return
         gs = self.gamestate
         n = self.p.i32(gs + O.GS_TAG2INDEX + O.PDXARRAY_SIZE)
-        tdb = self.p.u64(self.va(O.G_COUNTRYTAG_DB))
-        tarr = self.p.u64(tdb + O.PDXARRAY_DATA)
+        if sys.platform == "win32":
+            # 1.19.5.0: no image global holds the tag database -- it is an INLINE
+            # CPdxArray<std::string> right after the tag2index array (0x340+0x18).
+            # Same shape as Linux apart from the missing double dereference, and it
+            # is the LIVE array, so it also carries the dynamic tags D01.. created by
+            # releases and civil wars (size 443 == tag2index size 443).
+            tidb = gs + O.GS_TAG_DB
+            tarr = self.p.u64(tidb + O.PDXARRAY_DATA)
+            n_db = self.p.i32(tidb + O.PDXARRAY_SIZE)
+        else:
+            tdb = self.p.u64(self.va(O.G_COUNTRYTAG_DB))
+            tarr = self.p.u64(tdb + O.PDXARRAY_DATA)
+            n_db = self.p.i32(tdb + O.PDXARRAY_SIZE)
         # NOTE: the tag2index array can be LONGER than the tag database (441 vs
         # 440). The extra slot is reserved for countries created mid-game, such as by
         # a civil war, and it has NO NAME in the static database. Reading n entries goes
         # out of bounds and returns None. player_tag() used to break right here.
-        n_db = self.p.i32(tdb + O.PDXARRAY_SIZE)
         self._tags = [self.p.stdstring(tarr + i * O.STDSTRING_SZ)
                       if i < n_db else None for i in range(n)]
         tmap = self.p.u64(gs + O.GS_TAG2INDEX + O.PDXARRAY_DATA)
@@ -562,7 +763,11 @@ class HOI4:
         return None
 
     def player_tag_id(self) -> int:
-        """gamestate+0x518 is the played country's TAG INDEX, in tag2index space.
+        """The played country's TAG INDEX, in tag2index space.
+
+        Linux 1.19.4.1: gamestate+0x518.  Windows 1.19.5.0: gamestate+0x520 (0x518
+        reads 15 = SPR while playing GER; verified by switching tag: the field went
+        1 -> 16 -> 1 for GER -> ITA -> GER).
 
         Do NOT use +0x51C as a fallback: it is not the player tag. While playing GER
         it read 440, which looked valid by coincidence and pointed at the wrong country.
@@ -718,14 +923,13 @@ class HOI4:
         clock froze 71 days in the past.
         """
         try:
-            v = self.p.i32(addr)
-            f = struct.unpack("<f", self.p.read(addr - 8, 4))[0]
-            h = self.p.i32(addr - 4)
-            z = self.p.i32(addr + 4)
+            # one atomic read: the game ticks between separate reads and the
+            # four fields then disagree, which made a live clock look invalid
+            f, h, v, z = struct.unpack("<fiii", self.p.read(addr - 8, 16))
         except Exception:
             return False
         return (0 <= h <= 23 and z == 0 and (v % 24) == h
-                and abs(f - h / 24.0) < 1e-4
+                and abs(f - h / 24.0) < (2e-2 if sys.platform == "win32" else 1e-4)
                 and parts_to_date(1930, 1, 1) <= v <= parts_to_date(1948, 1, 1))
 
     def _date_from_log(self):
@@ -853,7 +1057,179 @@ class HOI4:
         self._date_exact_cache = (self.p.pid, _t.time(), best)
         return best
 
+    # ---------------------------------------------------------- Windows CDate
+    # 1.19.5.0/MSVC keeps the same CDate triple as the ELF build:
+    #   -0x08 float hour/24   -0x04 int32 hour   +0x00 int32 hour_counter   +0x04 0
+    # The counter is (year*365 + day_of_year)*24 + hour, so it is bounded and
+    # unique enough to scan for directly.  The Linux hint machinery is not used:
+    # its log paths do not exist here.
+    def _win_date_gs(self):
+        """CDate candidates inside the `CCurrentGameState` object itself.
+
+        BUG-20 in the 2026-11-15 playtest: the tool reported 1936.08.25 while the
+        HUD said 1937.02.  The old scanner looked at *every* writable region and
+        then had to guess which CDate copy was the live one; a copy left behind by
+        an earlier save is byte-for-byte identical in shape, so the guess can land
+        months in the past -- and a paused game gives the tick test nothing to see.
+
+        The current date is a member of the game-state object, and that object is a
+        single allocation we can walk.  Restricting the search to it removes the
+        ambiguity instead of guessing at it.  If the object has no such field the
+        list comes back empty and the caller falls back to the global scan.
+        """
+        out = []
+        try:
+            gs = self.gamestate
+        except Exception:
+            return out
+        if not gs:
+            return out
+        for off in range(0, 0x2000, 4):
+            a = gs + off
+            try:
+                if self._date_sig_ok(a):
+                    v = self.p.i32(a)
+                    if parts_to_date(1930, 1, 1) <= v <= parts_to_date(1970, 1, 1):
+                        out.append(a)
+            except Exception:
+                break
+        return out
+
+    def _win_date_scan(self):
+        import numpy as np
+        lo, hi = parts_to_date(1930, 1, 1), parts_to_date(1970, 1, 1)
+        hits = []
+        for m in self.p.regions(writable=True, min_size=4096):
+            a = m["start"]
+            while a < m["end"]:
+                n = min(8 << 20, m["end"] - a)
+                buf = self.p.try_read(a, n)
+                if buf and len(buf) >= 16:
+                    k = len(buf) // 4
+                    i32 = np.frombuffer(buf[:k * 4], dtype=np.int32)
+                    for i in np.nonzero((i32 >= lo) & (i32 <= hi))[0]:
+                        ad = a + int(i) * 4
+                        if self._date_sig_ok(ad):
+                            hits.append(ad)
+                a += n
+        return hits
+
+    def _win_date_addr(self):
+        """Pick the live CDate: the copy that ticks."""
+        import time as _t
+        cur = getattr(self, "_win_date", None)
+        if cur and getattr(self, "_win_date_pid", None) == self.p.pid:
+            try:
+                v = self.p.i32(cur)
+                last = getattr(self, "_win_date_last", None)
+                if (last is not None
+                        and parts_to_date(1935, 1, 1) <= v <= parts_to_date(1965, 1, 1)
+                        and 0 <= v - last <= 24 * 400):
+                    lrv = None
+                    try:
+                        lrv = self._log_date()
+                    except Exception:
+                        lrv = None
+                    if lrv and v > lrv + 24 * 45:
+                        # stale copy that a previous Game() cached: rescan
+                        self._win_date = None
+                        self._win_date_pid = None
+                        raise ValueError("date cache ahead of the log")
+                    if lrv and lrv - v > 24 * 60:
+                        # BUG-20: the cached copy is months BEHIND the game's own
+                        # log stamp, so it cannot be the live clock.  Drop it and
+                        # rescan (the game-state scan now usually finds the real
+                        # one directly).
+                        self._win_date = None
+                        self._win_date_pid = None
+                        raise ValueError("date cache behind the log")
+                    self._win_date_last = v
+                    return cur
+            except Exception:
+                pass
+        if getattr(self, "_win_date", None) is None:
+            gs_hits = self._win_date_gs()
+            if len(gs_hits) == 1:
+                # One unambiguous clock inside the game-state object: use it and
+                # never consult the global scan or the cross-process cache.
+                self._win_date = gs_hits[0]
+                self._win_date_pid = self.p.pid
+                self._win_date_last = self.p.i32(gs_hits[0])
+                return gs_hits[0]
+            try:
+                import json as _j, os as _o
+                c = _j.load(open(_o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "date_addr.json")))
+                if int(c.get("pid") or 0) == self.p.pid and c.get("addr"):
+                    ad = int(c["addr"], 16) if isinstance(c["addr"], str) else int(c["addr"])
+                    v0 = self.p.i32(ad)
+                    if parts_to_date(1935, 1, 1) <= v0 <= parts_to_date(1965, 1, 1):
+                        self._win_date = ad
+                        self._win_date_pid = self.p.pid
+                        self._win_date_last = v0
+                        return ad
+            except Exception:
+                pass
+        hits = self._win_date_gs()
+        if not hits:
+            hits = self._win_date_scan()
+        if not hits:
+            self._win_date = None
+            return None
+        last = getattr(self, "_win_date_last", None)
+        # A running game advances the real CDate once per day, and stale copies
+        # from earlier saves do not move.  Whatever ticked wins, unconditionally:
+        # preferring "newest" or "closest to last" both picked a 1945 remnant over
+        # the live 1936 date.  Only fall back to the heuristic when the game is
+        # paused and nothing moved at all.
+        if len(hits) > 1:
+            first = {a: self.p.i32(a) for a in hits}
+            _t.sleep(1.2)
+            ticked = [a for a in hits
+                      if self.p.try_read(a, 4) and self.p.i32(a) != first[a]]
+            if ticked:
+                hits = ticked
+                last = None
+        # Belt and braces for the paused case: keep only plausible campaign dates.
+        plausible = [a for a in hits
+                     if parts_to_date(1935, 1, 1) <= self.p.i32(a) <= parts_to_date(1965, 1, 1)]
+        if plausible:
+            hits = plausible
+        if last:
+            hits.sort(key=lambda a: abs(self.p.i32(a) - last))
+        elif len(hits) > 1:
+            # Paused: nothing ticked, so the "largest value" rule below used to
+            # hand back a frozen 1945 CDate inside a 1936 campaign (seen every
+            # time a fresh Game() was built while the game sat paused). The
+            # game's own log stamp is a lower bound that can lag the clock but
+            # can never be ahead of it, so prefer the candidate closest to it
+            # and throw away anything more than 45 days ahead of it.
+            lrv = None
+            try:
+                lrv = self._log_date()
+            except Exception:
+                lrv = None
+            if lrv:
+                # Keep only copies that cannot be in the future, then take the
+                # LARGEST: a stale copy always lags the live clock, so "closest
+                # to the log" picked a copy days behind (a probe read 1936.03.06
+                # while the same game was at 1936.03.08).
+                near = [a for a in hits if self.p.i32(a) <= lrv + 24 * 45]
+                if near:
+                    hits = near
+                hits.sort(key=lambda a: -self.p.i32(a))
+            else:
+                midday = [a for a in hits if self.p.i32(a) % 24]
+                if midday:
+                    hits = midday
+                hits.sort(key=lambda a: -self.p.i32(a))
+        self._win_date = hits[0]
+        self._win_date_pid = self.p.pid
+        self._win_date_last = self.p.i32(hits[0])
+        return hits[0]
+
     def find_date_address(self, force=False) -> int:
+        if sys.platform == "win32":
+            return self._win_date_addr()
         """Locate the game date. 1.19.4 layout of a CDate object:
 
             +0x00 ptr, +0x08 float (0..1, day fraction), +0x0C int32 hour,
@@ -1170,7 +1546,12 @@ class HOI4:
             base = os.path.join(ud, "logs")
             return (env_g or os.path.join(base, "game.log"),
                     env_e or os.path.join(base, "error.log"))
-        d = os.path.expanduser("~/.local/share/Paradox Interactive/Hearts of Iron IV/logs")
+        try:
+            import config as _cfg
+            d = os.path.join(_cfg.user_dir(), "logs")
+        except Exception:
+            d = os.path.expanduser(
+                "~/.local/share/Paradox Interactive/Hearts of Iron IV/logs")
         return env_g or os.path.join(d, "game.log"), env_e or os.path.join(d, "error.log")
 
     LOG_PATH = os.environ.get(

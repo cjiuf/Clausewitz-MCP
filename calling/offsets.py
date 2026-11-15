@@ -111,3 +111,12 @@ MONTH_LENGTHS = [31,28,31,30,31,30,31,31,30,31,30,31]
 # Date signature in memory: float(1/24)=0x3D2AAAAB, int32 date at +8, 0 at +12
 DATE_SIGNATURE_FLOAT = 0x3D2AAAAB
 DATE_SIG_TO_VALUE    = 8
+
+# ---------------------------------------------------------------- platform
+# On Windows the MSVC build has a completely different layout and a different
+# version number; offsets_win.py carries the 1.19.5.0 table and overrides every
+# name above.  Importing this module on Windows therefore yields the Windows
+# table, and no caller has to care.
+import sys as _sys
+if _sys.platform == "win32":                       # pragma: no cover
+    from offsets_win import *                      # noqa: F401,F403

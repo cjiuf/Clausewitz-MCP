@@ -21,8 +21,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from game import Game                       # noqa: E402
 import offsets as O                         # noqa: E402
 
+import config as _config                # noqa: E402
+
 PROTOCOL = "2024-11-05"
-GAME_DIR = "/mnt/C/Program Files (x86)/Steam/steamapps/common/Hearts of Iron IV"
+# Resolved from HOI4_PATH / the usual Steam locations, never hardcoded: the doc
+# file only feeds the command_help tooltips, so a miss is harmless.
+GAME_DIR = _config.game_dir(required=False) or ""
 DOC_MD = os.path.join(GAME_DIR, "documentation", "console_commands_documentation.md")
 
 _g: Game | None = None
@@ -188,6 +192,74 @@ def _hoi4_display():
     return cands[0] if cands else None
 
 
+def _win_hwnd(title_part="Hearts of Iron"):
+    """The game's top-level window handle (0 when it is not running)."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(h, _l):
+        buf = ctypes.create_unicode_buffer(256)
+        u.GetWindowTextW(h, buf, 256)
+        if title_part in buf.value and u.IsWindowVisible(h):
+            found.append(h)
+        return True
+
+    try:
+        u.EnumWindows(_enum, 0)
+    except Exception:
+        return 0
+    return found[0] if found else 0
+
+
+def _win_screenshot(crop=None, focus=False) -> bytes:
+    """Capture the HOI4 window on Windows and return PNG bytes.
+
+    `crop` uses the same "WxH+X+Y" syntax as the X11 path, relative to the game
+    window.  The window is only raised when `focus` is true.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from PIL import ImageGrab
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    u = ctypes.windll.user32
+    hwnd = _win_hwnd()
+    if not hwnd:
+        return b""
+    if focus:
+        u.ShowWindow(hwnd, 9)
+        u.SetForegroundWindow(hwnd)
+    class R(ctypes.Structure):
+        _fields_ = [("l", wintypes.LONG), ("t", wintypes.LONG),
+                    ("r", wintypes.LONG), ("b", wintypes.LONG)]
+    r = R()
+    if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+        return b""
+    box = (r.l, r.t, r.r, r.b)
+    img = ImageGrab.grab(bbox=box, all_screens=True)
+    if crop:
+        import re as _re
+        m = _re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str(crop).strip())
+        if m:
+            w, h, x, y = (int(g) for g in m.groups())
+            img = img.crop((x, y, x + w, y + h))
+    out = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    out.close()
+    img.save(out.name)
+    with open(out.name, "rb") as fh:
+        data = fh.read()
+    try:
+        os.unlink(out.name)
+    except OSError:
+        pass
+    return data
+
+
 def screenshot(crop=None, focus=False) -> bytes:
     """Screenshot of the game.
 
@@ -195,6 +267,11 @@ def screenshot(crop=None, focus=False) -> bytes:
     is never raised or focused, so it works while the user is in another app.
     If that fails it falls back to spectacle, which captures the whole screen.
     """
+    if sys.platform == "win32":
+        # BUG-17: the whole body below is X11 (xwd / import / spectacle), so on
+        # hoi4.exe it returned b"" and the agent was blind.  Grab the game's own
+        # window rectangle with PIL instead -- same thing stage/ui.py does.
+        return _win_screenshot(crop, focus)
     out = tempfile.NamedTemporaryFile(suffix=".png", delete=False); out.close()
     got = False
     disp = _hoi4_display()
@@ -1243,10 +1320,15 @@ def _draw_front(a):
       {"enemy_tag": {"type": "string", "description": "Country tag, e.g. HOL"},
        "force": {"type": "boolean",
                  "description": "Run even if the front cannot supply the whole army"},
+       "wait_seconds": {"type": "integer",
+                        "description": "Poll this long for the first enemy province to change "
+                                       "hands. At speed 1 the plan needs ~10 game days (~3 "
+                                       "minutes); 0 (default) returns once the plan is built."},
        **TAG}, ["enemy_tag"])
 def _army_battleplans(a):
     return game().activate_army_battleplans(a["enemy_tag"], a.get("tag"),
-                                            bool(a.get("force")))
+                                            bool(a.get("force")),
+                                            int(a.get("wait_seconds") or 0))
 
 
 @tool("hoi4_deploy_to_border",
@@ -1423,6 +1505,33 @@ def _orders(a):
       {**OG, "order_id": {"type": "integer"}}, ["orders_group"])
 def _exec_plan(a):
     return game().execute_plan(_ptr(a["orders_group"]), a.get("order_id", 0))
+
+
+@tool("hoi4_offensive_line",
+      "Draw the OFFENSIVE LINE (the arrow inside a front line) under an existing front order "
+      "and mark it executing. Targets are the enemy provinces `depth` steps in from the border "
+      "(default 2, i.e. skip the first row the front already covers). Windows backend: "
+      "armyops_win.offensive_line + start_offensives.",
+      {**OG, "parent_order_id": {"type": "integer",
+                                 "description": "id of the type-2 front order (from hoi4_orders)"},
+       "enemy_tag": {"type": "string"}, "depth": {"type": "integer"}, **TAG},
+      ["orders_group", "parent_order_id", "enemy_tag"])
+def _offensive_line(a):
+    import sys as _sys
+    g = game()
+    if _sys.platform != "win32":
+        return {"ok": False, "error": "hoi4_offensive_line is implemented for the Windows "
+                                      "backend only (armyops_win)"}
+    import armyops_win as A
+    og = _ptr(a["orders_group"])
+    provs = A.target_provinces(g, a["enemy_tag"], depth=a.get("depth", 2), own_tag=a.get("tag"))
+    res = g.offensive_line(og, a["parent_order_id"], provs)
+    res["targets"] = len(provs)
+    if res.get("ok"):
+        res["flags"] = A.start_offensives(g, og)
+        res["children"] = [(c["id"], c["assigned"], c["executing"])
+                           for c in A.order_children(g, og)]
+    return res
 
 
 @tool("hoi4_delete_order", "Delete a battle plan order.",
@@ -1809,6 +1918,72 @@ def _send_dip(a):
 def _declare_war(a):
     return game().declare_war(a["target"], a.get("dry_run", False),
                               a.get("force", False))
+
+
+# ------------------------------------------------------------ peace conference
+def _country_index(g, tag):
+    if not tag:
+        return int(g.player_tag_id())
+    g._load_tags()
+    return int(g._tag2idx[g._tags.index(tag)])
+
+
+@tool("hoi4_peace_status",
+      "Peace conference: whether one is open, the engine's bidding maps, and each "
+      "participant's score. Cheap (O(1)) -- safe to poll after a country capitulates.", NO_ARGS)
+def _peace_status(a):
+    import peacewin
+    return peacewin.summary(game())
+
+
+@tool("hoi4_peace_demands",
+      "Submit peace-conference demands for the player (or `winner`) against a beaten country. "
+      "This is the conference's 提交要求 button: the demands go into the conference's turn map "
+      "exactly as if they had been selected and submitted in the window, including "
+      "`kinds=state` taking *every* state of the loser (the window's select-all).",
+      {"loser": dict(_STR, description="Country tag that lost, e.g. HOL"),
+       "winner": dict(_STR, description="Country that takes (empty = the player)"),
+       "kinds": {"type": "array", "items": {"type": "string",
+                                            "enum": ["state", "puppet", "navy", "liberate", "gov"]},
+                 "description": "Demand types; default ['state']"}},
+      ["loser"])
+def _peace_demands(a):
+    import peacewin
+    g = game()
+    with g:
+        conf = peacewin.live_conference(g)
+        if not conf:
+            return {"ok": False, "error": "no peace conference is open"}
+        win = _country_index(g, a.get("winner"))
+        lose = _country_index(g, a["loser"])
+        kinds = a.get("kinds") or ["state"]
+        turn, acts = peacewin.submit_demands(g, conf, win, lose, kinds)
+        return {"ok": True, "turn": turn, "actions": len(acts),
+                "detail": [{"type": g.p.i32(x + 8), "winner": g.p.i32(x + 0x30),
+                            "loser": g.p.i32(x + 0x34), "state": g.p.i32(x + 0x48)}
+                           for x in acts],
+                "status": peacewin.summary(g)}
+
+
+@tool("hoi4_peace_finish",
+      "Advance a peace conference: `done` = 确认并退出 (applies the treaty; it does NOT "
+      "pass first -- `pass` adds a second turn and the engine then hangs while resizing the "
+      "history, research 71), `pass` = 跳过本轮, `endturn` = end this country's turn. "
+      "Runs the command body directly because the CCommand queue does not drain while a "
+      "conference is open.",
+      {"action": {"type": "string", "enum": ["pass", "endturn", "done"]},
+       "tag": dict(_STR, description="Country to act for (empty = the player)")},
+      ["action"])
+def _peace_finish(a):
+    import peacewin
+    g = game()
+    with g:
+        if a["action"] == "done":
+            # `pass` appends a second turn to +0x1F8 and the engine then resizes the
+            # history (2 -> 1) while applying the treaty -- that path hung the game
+            # twice on 2026-11-15 (research 71).  Done on its own keeps the count at 1.
+            return peacewin.finish(g, _country_index(g, a.get("tag")))
+        return peacewin.execute(g, a["action"], _country_index(g, a.get("tag")))
 
 
 @tool("hoi4_debug_console",

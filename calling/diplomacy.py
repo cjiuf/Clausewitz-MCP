@@ -63,7 +63,22 @@ def wargoal_types(g):
             hits = []
     for w in hits:
         try:
-            n = p.cstr(p.u64(w + 0x10))
+            import sys as _sys
+            if _sys.platform == "win32":
+                # 1.19.5: the name is a MSVC std::string at +0x18 (buffer),
+                # size at +0x28, capacity at +0x30 -- not a char* at +0x10.
+                # Reading +0x10 as a pointer produced garbage for every entry,
+                # so the map came back empty and justify_wargoal rejected every
+                # name ("unknown wargoal (options: )").
+                sz = p.i64(w + 0x28)
+                cap = p.i64(w + 0x30)
+                if cap >= 16:
+                    n = (p.read(p.u64(w + 0x18), sz).decode("utf-8", "replace")
+                         if 0 < sz < 200 else "")
+                else:
+                    n = p.read(w + 0x18, max(0, min(sz, 15))).decode("utf-8", "replace")
+            else:
+                n = p.cstr(p.u64(w + 0x10))
         except Exception:
             continue
         if n and n.isprintable():

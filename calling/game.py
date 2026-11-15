@@ -6,31 +6,37 @@ CCommand queue, the same path a mouse click takes. Eligibility is checked by
 calling the game's own functions.
 """
 from __future__ import annotations
-import os, struct, time
+import os, struct, sys, time
 from typing import Optional
 
 from api import HOI4, Country
 from commands import CommandLayer
 from explore import cstring
 import offsets as O
-import rtti as R
+if sys.platform == "win32":
+    # MSVC RTTI (PE) instead of Itanium RTTI (ELF); same {"vtables": ...} shape.
+    import rtti_win as R
+else:
+    import rtti as R
 from objindex import ObjectIndex
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ------------------------------------------------------------------ offsets
 # CCountry subsystems
-CO_TECH_STATUS      = 0x0F38   # CTechnologyStatus*
-CO_PRODUCTION       = 0x0F40   # CProductionStatus*
-CO_ARMY_UPGRADES    = 0x0F58
-CO_DIPLOMACY        = 0x0F60   # CDiplomacyStatus*
-CO_POLITICS         = 0x0F68   # CPoliticalStatus*
-CO_DECISIONS        = 0x0F78   # CDecisionStatus*
-CO_INTEL_AGENCY     = 0x0F98
-CO_COUNTRY_INTEL    = 0x0FC0
-CO_FOCUS_TREE       = 0x1338   # CNationalFocusTree*
-CO_CONT_FOCUS_PAL   = 0x1340
-CO_FOCUS_PROGRESS   = 0x1348   # CNationalFocusProgress*
+# Every one of these is a pointer to a status sub-object, and the Windows build
+# moved them (0xF38 -> 0xF60 etc), so prefer the verified Windows table.
+CO_TECH_STATUS      = getattr(O, "CO_TECHNOLOGY_STATUS", 0x0F38)   # CTechnologyStatus*
+CO_PRODUCTION       = getattr(O, "CO_PRODUCTION_STATUS", 0x0F40)   # CProductionStatus*
+CO_ARMY_UPGRADES    = getattr(O, "CO_ARMY_UPGRADES_STATUS", 0x0F58)
+CO_DIPLOMACY        = getattr(O, "CO_DIPLOMACY_STATUS", 0x0F60)    # CDiplomacyStatus*
+CO_POLITICS         = getattr(O, "CO_POLITICAL_STATUS", 0x0F68)    # CPoliticalStatus*
+CO_DECISIONS        = getattr(O, "CO_DECISION_STATUS", 0x0F78)     # CDecisionStatus*
+CO_INTEL_AGENCY     = getattr(O, "CO_INTELLIGENCE_AGENCY", 0x0F98)
+CO_COUNTRY_INTEL    = getattr(O, "CO_COUNTRY_INTEL", 0x0FC0)
+CO_FOCUS_TREE       = getattr(O, "CO_FOCUS_TREE", 0x1338)   # CNationalFocusTree*
+CO_CONT_FOCUS_PAL   = getattr(O, "CO_CONT_FOCUS_PAL", 0x1340)
+CO_FOCUS_PROGRESS   = getattr(O, "CO_FOCUS_PROGRESS", 0x1348)   # CNationalFocusProgress*
 CO_FACTION          = 0x2B00
 CO_STATES           = 0x460   # CPdxArray<CState*>, owned states
 CO_CAPITAL_STATE    = 0xFF0   # int32 state id of the capital (NOT a province id)
@@ -62,19 +68,30 @@ TS_ALL_TECHS        = 0x88     # CPdxArray<CTechnology*>
 TS_SLOTS            = 0xA0     # CPdxArray<CResearchSlot*>
 TS_PRODUCTION_LINES = 0x2B8
 
-# CResearchSlot
+# CResearchSlot  (0x48 bytes; ctor 0xF4F4F0, dtor frees 0x48)
+# The three fields below are exactly the ones `CResearchSlot::Save` (0xF61BF0)
+# writes, with the engine's own member tags: +0x20 -> 0x31DE, +0x28 -> 0x34BB,
+# +0x38 -> 0x3684.  They do NOT hold the live progress of the current
+# technology: +0x20 is the progress carried over when a slot switches tech and
+# +0x28 is the required amount computed at that moment (both stay 0/constant
+# while a tech runs).  The bar the UI draws comes from the CTechnology object
+# (TE_PROGRESS) against the template cost.
 RS_OWNER            = 0x10
 RS_CURRENT          = 0x18     # CTechnology* (0 = empty)
-RS_PROGRESS         = 0x20
-RS_REQUIRED         = 0x28
-RS_SPEED            = 0x38
+RS_PROGRESS         = 0x20     # carried-over progress, 1e5 fixed
+RS_REQUIRED         = 0x28     # required for the carried-over progress, 1e5
+RS_SPEED            = 0x38     # research speed, 1e5 fixed (1.01 = +1%/day)
+RS_INDEX            = 0x40     # int32 slot index
 
 # CTechnology (per-country state object)
 TE_ID               = 0x08
+TE_TEMPLATE         = 0x160    # CTechnologyTemplate* (vtable 0x29B9F10)
+TE_PROGRESS         = 0x198    # int64 research days x1e5, speed-weighted
 # CTechnologyTemplate (global definition)
-TT_NAME             = 0x08     # CString
-TT_ID               = 0x34
-TT_RESEARCH_COST    = 0x3D0   # int32 x1e5, research cost (days = cost*100)
+TT_NAME             = getattr(O, "TT_NAME", 0x08)   # CString / std::string
+TT_ID               = getattr(O, "TT_ID", 0x34)
+TT_YEAR             = 0x3D8    # int32 start year (advanced_ship_hull_light -> 1943)
+TT_RESEARCH_COST    = 0x3E0    # int32, days x1000 (150000 = 150 days)
 
 # CProductionStatus
 PS_LINES            = 0x58     # CPdxArray<CMilitaryProductionLine*/CNavalProductionLine*>
@@ -96,7 +113,10 @@ ML_TOTAL_PRODUCED   = 0xF8
 
 # CBuildingProductionLine (construction)
 BL_OWNER            = 0x20
-BL_PROGRESS         = 0x28
+BL_PROGRESS         = 0x38     # int64 accumulated IC-days (1.19.5). Verified
+                              # 2026-11-15 by diffing a live line over 25 s: only
+                              # this field moved (1466.56 -> 1486.36 of 10800).
+BL_COST             = 0x28     # int64 total cost in IC-days (10800 for a civ factory)
 BL_BUILDING         = 0x78     # CBuilding* (1.19.4.1; was 0x70 in 1.19.2)
 
 # CEquipmentVariant
@@ -106,12 +126,12 @@ ET_ID               = 0x08
 ET_NAME             = 0x10     # CString
 # CBuildingTemplate
 BT_ID               = 0x08
-BT_NAME             = 0x1E8    # display name
-BT_KEY              = 0x248    # key ("industrial_complex")
+BT_NAME             = getattr(O, "BT_NAME", 0x1E8)   # display name (None if the build has none)
+BT_KEY              = getattr(O, "BT_KEY", 0x248)    # key ("industrial_complex")
 # CBuilding (example)
 BG_TYPE_ID          = 0x08
 # CState
-ST_ID               = 0x48     # int32, state id
+ST_ID               = getattr(O, "ST_ID", 0x48)   # int32, state id
 # CBuildingReference { vptr; int32 state; int32 building_type; int32 province; }
 BUILDING_REF_VTABLE = 0x4348A90   # CBuildingReference vtable, 1.19.4.1
 
@@ -155,11 +175,15 @@ def _arr(p, obj, off, limit=100000):
     a long housekeep loop. Anything larger than `limit` is treated as "not an array
     we understand" and ignored.
     """
-    n = p.i32(obj + off + O.PDXARRAY_SIZE)
-    d = p.u64(obj + off + O.PDXARRAY_DATA)
-    if n <= 0 or not d or n > limit:
+    try:
+        n = p.i32(obj + off + O.PDXARRAY_SIZE)
+        d = p.u64(obj + off + O.PDXARRAY_DATA)
+        if n <= 0 or not d or n > limit or d < 0x10000:
+            return []
+        return list(struct.unpack("<%dQ" % n, p.read(d, 8 * n)))
+    except OSError:
+        # wrong offset / not an array of pointers: report empty instead of dying
         return []
-    return list(struct.unpack("<%dQ" % n, p.read(d, 8 * n)))
 
 
 def _count(p, obj, off):
@@ -304,6 +328,15 @@ class Game(HOI4):
         f = self.find_focus(key, tag)
         if not f:
             raise KeyError("focus not found: %s" % key)
+        if sys.platform == "win32":
+            import cmdwin
+            r = cmdwin.set_national_focus(self, f, c.tag_id)
+            self._settle()
+            prog = self.p.u64(c.ptr + CO_FOCUS_PROGRESS)
+            got = self.p.u64(prog + FP_CURRENT) if prog else 0
+            r.update({"focus": key, "current": hex(got) if got else None,
+                      "ok": bool(r.get("ok")) and got == f})
+            return r
         with self:
             self.cmd.send("SetNationalFocus", tag=c.tag_id, focus_ptr=f)
         self._settle()
@@ -324,6 +357,15 @@ class Game(HOI4):
         """
         c = self._c(tag)
         f = int(focus_ptr)
+        if sys.platform == "win32":
+            import cmdwin
+            r = cmdwin.set_national_focus(self, f, c.tag_id)
+            self._settle()
+            prog = self.p.u64(c.ptr + CO_FOCUS_PROGRESS)
+            got = self.p.u64(prog + FP_CURRENT) if prog else 0
+            r.update({"focus_ptr": hex(f), "current": hex(got) if got else None,
+                      "ok": bool(r.get("ok")) and got == f})
+            return r
         with self:
             self.cmd.send("SetNationalFocus", tag=c.tag_id, focus_ptr=f)
         self._settle()
@@ -336,6 +378,15 @@ class Game(HOI4):
 
     def drop_focus(self, tag=None):
         c = self._c(tag)
+        if sys.platform == "win32":
+            import cmdwin
+            r = cmdwin.drop_national_focus(self, c.tag_id)
+            self._settle()
+            prog = self.p.u64(c.ptr + CO_FOCUS_PROGRESS)
+            got = self.p.u64(prog + FP_CURRENT) if prog else 0
+            r.update({"current": hex(got) if got else None,
+                      "ok": bool(r.get("ok")) and got == 0})
+            return r
         with self:
             self.cmd.send("DropCurrentNationalFocus", tag=c.tag_id)
         self._settle()
@@ -368,6 +419,15 @@ class Game(HOI4):
                 if nm:
                     byname[nm] = t
                     byid[p.i32(t + TT_ID)] = nm
+        if not byname:
+            # The database object exists but is still empty (it is filled after the
+            # campaign finishes loading).  Caching {} here made every later lookup
+            # come back empty for the rest of the process -- hoi4_research_available
+            # then reported count 0 for good.
+            self._tech_by_name = None
+            self._tech_by_id = {}
+            self._oi = None
+            return
         self._tech_by_name, self._tech_by_id = byname, byid
 
     def tech_name(self, tech_obj):
@@ -379,33 +439,62 @@ class Game(HOI4):
         return self.p.u64(self._c(tag).ptr + CO_TECH_STATUS)
 
     def tech_cost_days(self, tech_name):
-        """Base research time of a technology, in days."""
+        """Base research time of a technology, in days.
+
+        `CTechnologyTemplate+0x3E0` holds days x1000 on the PE build (verified:
+        basic_machine_tools 150000 -> "130日"-class values, synth_oil_experiments
+        300000, improved_light_tank_chassis 200000).  The old 0x3D0 is not the
+        cost: it reads -1 for most techs (0x3D8 is the start year).
+        """
         self._load_tech_db()
         t = self._tech_by_name.get(tech_name)
-        return round(self.p.i32(t + TT_RESEARCH_COST) / O.FIXED * 100, 1) if t else None
+        if not t:
+            return None
+        raw = self.p.i32(t + TT_RESEARCH_COST)
+        if not (0 < raw < 100000 * 1000):
+            return None
+        return round(raw / 1000.0, 1)
+
+    def tech_progress(self, tech_obj):
+        """Research days already invested in a CTechnology, speed-weighted."""
+        if not tech_obj:
+            return 0.0
+        return self.p.i64(tech_obj + TE_PROGRESS) / float(O.FIXED)
 
     def research_slots(self, tag=None):
+        """What each research slot is doing, with the UI's own numbers.
+
+        Progress lives on the technology, not on the slot:
+            progress_days = CTechnology+0x198 / 1e5
+            cost_days     = CTechnologyTemplate+0x3E0 / 1000
+            speed         = CResearchSlot+0x38 / 1e5   (days gained per day)
+        Verified two ways on 1.19.5.0 (2026-11-15):
+          * every tech the country starts with shows progress == cost * 1.1
+            (56/56 at exactly 1.1, the start-of-game research speed);
+          * a running tech gains exactly `speed` x 1e5 per daily tick
+            (basic_machine_tools 3535000 -> 3636000 -> ... , speed 101000).
+        """
         p = self.p
         ts = self.tech_status(tag)
         out = []
         for i, s in enumerate(_arr(p, ts, TS_SLOTS)):
             cur = p.u64(s + RS_CURRENT)
             nm = self.tech_name(cur) if cur else None
-            prog, req = p.i64(s + RS_PROGRESS), p.i64(s + RS_REQUIRED)
-            speed = p.i64(s + RS_SPEED) / O.FIXED or 1.0
-            pct = round(100.0 * prog / req, 2) if (cur and req) else 0.0
-            base = self.tech_cost_days(nm) if nm else None
+            speed = p.i64(s + RS_SPEED) / float(O.FIXED) or 1.0
+            prog_days = self.tech_progress(cur) if cur else 0.0
+            cost_days = self.tech_cost_days(nm) if nm else None
+            pct = round(100.0 * prog_days / cost_days, 2) if cost_days else 0.0
             rec = {
                 "slot": i,
                 "researching": nm,
-                "progress": round(prog / O.FIXED, 3) if cur else 0.0,
-                "required": round(req / O.FIXED, 3) if cur else 0.0,
-                "percent": pct,
+                "progress": round(prog_days, 3),          # days of research done
+                "required": round(cost_days, 3) if cost_days else 0.0,  # days to do
+                "percent": min(pct, 100.0),
                 "speed": speed,
-                "base_days": base,
+                "base_days": cost_days,
             }
-            if base:
-                rec["days_remaining"] = round(base * (1 - pct / 100.0) / speed, 1)
+            if cost_days:
+                rec["days_remaining"] = round(max(cost_days - prog_days, 0.0) / speed, 1)
             out.append(rec)
         return out
 
@@ -474,6 +563,15 @@ class Game(HOI4):
             if not free:
                 return {"ok": False, "error": "no free research slot"}
             slot = free[0]
+        if sys.platform == "win32":
+            # Real command channel on the PE build: hand-built CSetResearchCommand
+            # + Post(session, cmd). See calling/cmdwin.py.
+            import cmdwin
+            cmdwin.set_research(self, tmpl, slot, c.tag_id)
+            self._settle()
+            after = self.research_slots(tag)
+            return {"ok": after[slot]["researching"] == tech_name, "slot": slot,
+                    "researching": after[slot]["researching"]}
         with self:
             if FN_CAN_RESEARCH is not None and \
                     not self.call(FN_CAN_RESEARCH, (self.tech_status(tag), tmpl, 0)) & 0xFF:
@@ -533,6 +631,15 @@ class Game(HOI4):
         game either dereferenced NULL or freed a wild pointer — the "law/decision
         randomly refused or crashed" bug. One helper, one correct SSO string.
         """
+        if sys.platform == "win32":
+            # PE: 0x20AE0A0 is a Linux VA and the error sink is a libstdc++
+            # std::string.  `cmdwin.enqueue` stamps the session tick/seq and hands
+            # the object to the queue, which is the path every working Windows
+            # command (focus / research / construction / war) takes.
+            import cmdwin
+            rv = cmdwin.enqueue(self, cmd)
+            self._last_cmd_error = ""
+            return rv
         s = self.malloc(0x20)
         self.p.write(s, struct.pack("<QQ", s + 0x10, 0) + b"\0" * 16)
         try:
@@ -1285,13 +1392,19 @@ class Game(HOI4):
             self._oi = None
             return
         bykey, byid = {}, {}
-        for t in _arr(p, db, 0x40):
+        for t in _arr(p, db, getattr(O, "BLD_DB_ITEMS", 0x40)):
             key = item_name(p, t + BT_KEY)
             if key:
                 bid = p.i32(t + BT_ID)
-                bykey[key] = {"id": bid, "name": item_name(p, t + BT_NAME), "ptr": t,
+                name = item_name(p, t + BT_NAME) if BT_NAME else None
+                bykey[key] = {"id": bid, "name": name or key, "ptr": t,
                               "province_level": p.i32(t + 0x294) > 0}
                 byid[bid] = key
+        # Type ids the database does not describe (Windows: `infrastructure`).
+        for bid, key in getattr(O, "BT_EXTRA", {}).items():
+            bykey.setdefault(key, {"id": bid, "name": key, "ptr": 0,
+                                   "province_level": True})
+            byid[bid] = key
         self._bld_by_key, self._bld_by_id = bykey, byid
 
     def building_types(self):
@@ -1309,8 +1422,11 @@ class Game(HOI4):
         # produced garbage and an EFAULT). Separate each element by its class.
         for i, l in enumerate(_arr(p, ps, PS_CONSTRUCTION)):
             cls = self.oi.class_of(l)
+            prog = p.i64(l + BL_PROGRESS) / O.FIXED
+            cost = p.i64(l + BL_COST) / O.FIXED
             row = {"index": i, "class": cls,
-                   "progress": p.i64(l + BL_PROGRESS) / O.FIXED}
+                   "progress": (prog / cost) if cost > 0 else 0.0,
+                   "progress_ic": prog, "cost_ic": cost}
             if cls == "CBuildingProductionLine":
                 b = p.u64(l + BL_BUILDING)
                 row["building"] = (self._bld_by_id.get(p.i32(b + BG_TYPE_ID))
@@ -1332,6 +1448,17 @@ class Game(HOI4):
         b = self._bld_by_key.get(building)
         if not b:
             raise KeyError("no such building type: %s (see building_types)" % building)
+        if sys.platform == "win32":
+            # Real command channel on the PE build.  `construction_queue()` cannot
+            # see the result yet (its array offset is still wrong on Windows), so
+            # success is reported from the enqueue itself; read the state's
+            # buildings to confirm.
+            import cmdwin
+            r = cmdwin.add_construction(self, int(state_id), b["id"], level)
+            self._settle()
+            return {"ok": bool(r.get("ok")), "state": int(state_id),
+                    "building": building, "type_id": b["id"], "level": level,
+                    "cmd": r.get("cmd")}
         before = len(self.construction_queue(c.tag))
         # CBuildingReference (1.19.4.1, verified by disassembly and live test):
         #   +0x08 = location id   (state id for a state-level building, province id
@@ -1379,6 +1506,12 @@ class Game(HOI4):
         # capped at 4 and silently ran the campaign one notch slow.
         if not 0 <= speed <= 5:
             raise ValueError("speed must be between 0 and 5")
+        if sys.platform == "win32":
+            # commands.py is the Linux build: FN_NEW (0x510950) is a Linux VA and
+            # calling it on the PE takes the process down. Windows goes through
+            # cmdwin, which allocates from the game's own allocator.
+            import cmdwin
+            return {"ok": True, "speed": speed, "posted": cmdwin.set_game_speed(self, speed)}
         with self:
             self.cmd.send("SetGameSpeed", speed=speed)
         return {"ok": True, "speed": speed}
@@ -2172,7 +2305,177 @@ class MacroMixin:
         except Exception as e:
             return {"ok": True, "error": repr(e)}
 
-    def activate_army_battleplans(self, enemy_tag, tag=None, force=False):
+    def _win_battleplans(self, enemy_tag, tag=None, force=False, wait_seconds=0):
+        """activate_army_battleplans for hoi4.exe: the chain stage/wden.py proved live.
+
+        create_army -> front line (CFront section facing the enemy) -> offensive
+        line under THAT order -> execute -> set the executing flag.
+
+        Two things this learned the hard way:
+          * the engine only hands the divisions to the offensive child while the
+            simulation is RUNNING.  Building the plan on a paused game produces a
+            child with `assigned == 0` and nothing ever moves, so the method
+            unpauses for the duration and restores the pause flag afterwards;
+          * "posted" is not "created".  Every step is polled and read back.
+        """
+        import time
+        import armyops_win as A
+        p = self.p
+        enemy_tag = str(enemy_tag).upper()
+        out = {"enemy_tag": enemy_tag, "backend": "windows", "steps": {}}
+
+        if not force:
+            try:
+                enemies = (self.wars(tag) or {}).get("enemies") or []
+            except Exception:
+                enemies = []
+            if enemy_tag not in enemies:
+                out.update({"ok": False,
+                            "error": "not at war with %s "
+                                     "(pass force=true to draw the plan anyway)"
+                                     % enemy_tag,
+                            "enemies": enemies})
+                return out
+
+        idler = p.u64(p.base + 0x33DDB08)
+        was_paused = bool(idler and p.u8(idler + 0x6C1))
+        out["resumed_for_plan"] = was_paused
+        if was_paused:
+            p.write(idler + 0x6C1, b"\x00")
+        try:
+            segs = A.fronts_towards(self, enemy_tag, tag)
+            out["steps"]["fronts"] = [{"handle": s["front_handle"], "section": s["section"],
+                                       "border": len(s["border_provinces"])} for s in segs]
+            if not segs:
+                out.update({"ok": False, "error": "no front section faces %s" % enemy_tag})
+                return out
+            best = max(segs, key=lambda s: len(s["border_provinces"]))
+            targets = A.target_provinces(self, enemy_tag, depth=2, own_tag=tag)
+            out["steps"]["targets"] = targets[:20]
+            if not targets:
+                out.update({"ok": False, "error": "no enemy province two steps in"})
+                return out
+
+            divs = [int(d["ptr"], 16) for d in (self.divisions(tag) or {}).get("divisions", [])]
+            if not divs:
+                out.update({"ok": False, "error": "no divisions"})
+                return out
+            # One group only if every division already lives in the same one;
+            # otherwise make a new army (this is what stage/wden.py did -- the
+            # 1936 save has 4 divisions in an army and 26 floating).
+            ogs = {p.u64(d + A.CARMY_OG) for d in divs}
+            og = next(iter(ogs)) if len(ogs) == 1 and 0 not in ogs else 0
+            if not og:
+                ok, err = A.create_army(self, divs)
+                out["steps"]["create_army"] = {"ok": ok, "error": err}
+                if not ok:
+                    out.update({"ok": False, "error": err})
+                    return out
+                og = p.u64(divs[0] + A.CARMY_OG)
+            out["steps"]["orders_group"] = hex(og)
+            out["steps"]["divisions"] = len(A.divisions_of(self, og))
+
+            def wait(fn, seconds=6.0):
+                t0 = time.time()
+                while time.time() - t0 < seconds:
+                    v = fn()
+                    if v:
+                        return v
+                    time.sleep(0.25)
+                return None
+
+            handle = tuple(best["front_handle"])
+            roots = [o for o in A.orders(self, og)
+                     if o["type"] == 2 and tuple(o.get("root_front") or ()) == handle]
+            if roots:
+                root_id = roots[-1]["id"]
+                out["steps"]["front_line"] = {"ok": True, "reused": root_id}
+            else:
+                before = {o["id"] for o in A.orders(self, og)}
+                ok, err, _cmd = A.draw_front_line(self, og, best["front"], best["section"],
+                                                  0, A.FULL, divisions=divs)
+                fresh = wait(lambda: [o for o in A.orders(self, og)
+                                      if o["id"] not in before and o["type"] == 2])
+                out["steps"]["front_line"] = {
+                    "ok": ok and bool(fresh), "error": err,
+                    "new_orders": [o["id"] for o in (fresh or [])]}
+                if not fresh:
+                    out.update({"ok": False, "error": "no front order appeared"})
+                    return out
+                root_id = fresh[-1]["id"]
+
+            kids = [c for c in A.order_children(self, og)
+                    if c["root"] == root_id and c["type"] == A.ORDER_TYPE_OFFENSIVE]
+            if kids and any(k["assigned"] for k in kids):
+                out["steps"]["offensive_line"] = {"ok": True, "reused": [k["id"] for k in kids]}
+            else:
+                ok, err, _cmd = A.offensive_line(self, og, root_id, targets, divs)
+                kids = wait(lambda: [c for c in A.order_children(self, og)
+                                     if c["root"] == root_id
+                                     and c["type"] == A.ORDER_TYPE_OFFENSIVE
+                                     and c["assigned"] > 0])
+                out["steps"]["offensive_line"] = {
+                    "ok": ok and bool(kids), "error": err,
+                    "children": [k["id"] for k in (kids or [])]}
+                if not kids:
+                    out.update({"ok": False,
+                                "error": err or "no offensive child with divisions"})
+                    return out
+
+            ok, err, _cmd = A.execute_plan(self, og, 0)
+            time.sleep(0.5)
+            out["steps"]["execute"] = {"ok": ok, "error": err}
+
+            # THE GREEN TICK is the ARROW: the type-2 offensive line carries its
+            # own +0x248.  COrderExecuteCommand only sets that byte when it is
+            # given an order id AND flag=1 (ctor: [+0x30]=id, [+0x34]=flag,
+            # 0x18C8D24), and our helper passes flag=0 -- i.e. `execute(id)` is
+            # the toggle OFF.  So set it through the engine's setter instead.
+            # Note the delay: the divisions need ~2 game days of planning before
+            # the first province falls (measured 2026-11-15, research 70.6).
+            arrows = [c for c in A.order_children(self, og)
+                      if c["root"] == root_id and c["type"] == 2]
+            if arrows:
+                arrow_id = arrows[-1]["id"]
+                byte = A.set_order_executing(self, arrows[-1]["ptr"], True)
+                out["steps"]["activate"] = {"ok": byte == 1, "order": arrow_id}
+            out["steps"]["flags"] = A.start_offensives(self, og)
+            out["steps"]["children"] = [(c["id"], c["assigned"], c["executing"])
+                                        for c in A.order_children(self, og)]
+            out["ok"] = all(c[2] == 1 for c in out["steps"]["children"]
+                            if c[1] > 0) and bool(out["steps"]["children"])
+
+            if wait_seconds:
+                # How long the plan takes to bite.  Measured 2026-11-15 at speed 1:
+                # the first enemy province changes hands ~10-11 GAME DAYS after the
+                # plan is built -- the divisions have to redeploy onto the front
+                # line first.  Every "it never advances" report before that was a
+                # window that was simply too short (research 70.6).
+                import mapdata
+                enemy_provs = set(sum(A.owned_provinces(self, enemy_tag).values(), []))
+                t0 = time.time()
+                start = None
+                gains = 0
+                while time.time() - t0 < float(wait_seconds):
+                    cm = mapdata.province_controller_map(self)
+                    gains = sum(1 for x in enemy_provs if cm.get(x) == (tag or self.player_tag()))
+                    if start is None:
+                        start = time.time()
+                    if gains:
+                        break
+                    time.sleep(5)
+                out["steps"]["advance"] = {
+                    "waited": round(time.time() - t0, 1),
+                    "enemy_provinces_taken": gains,
+                    "date": self.date()["text"],
+                }
+            return out
+        finally:
+            if was_paused and idler:
+                p.write(idler + 0x6C1, b"\x01")
+
+    def activate_army_battleplans(self, enemy_tag, tag=None, force=False,
+                                  wait_seconds=0):
         """One-shot: unassigned divisions -> armies -> front line -> offensive line -> execute.
 
         2026-11-08 (work order 1108 §3.2). Replaces the run-13 version, which
@@ -2186,6 +2489,8 @@ class MacroMixin:
         be POLLED from outside the attach session. Never sleep inside `with self:`.
         """
         import time
+        if sys.platform == "win32":
+            return self._win_battleplans(enemy_tag, tag, force, wait_seconds)
         import armyops
         p = self.p
         co = self._c(tag)
@@ -2813,7 +3118,10 @@ class MacroMixin:
         army existed, and a second call in the same paused tick took the SAME
         divisions again and silently did nothing. Both are reported honestly now.
         """
-        import armyops
+        if sys.platform == "win32":
+            import armyops_win as armyops
+        else:
+            import armyops
         def _n():
             try:
                 return (self.order_groups(tag) or {}).get("count")
@@ -2829,6 +3137,10 @@ class MacroMixin:
         after = _n()
         res = {"ok": ok, "error": err, "divisions": len(divs),
                "armies_before": before, "armies_after": after}
+        if sys.platform == "win32":
+            # armyops_win calls 0xC417A0 directly, so the army exists the moment
+            # the call returns -- no queue, no tick, nothing to wait for.
+            return res
         if ok and before is not None and after is not None and after <= before:
             res["queued"] = True
             res["note"] = ("army count %s -> %s: the command is queued and lands on the "
@@ -2875,6 +3187,13 @@ class MacroMixin:
 
     def border_fronts(self, enemy_tag, tag=None):
         """Front sections facing the target country, for drawing a line."""
+        if sys.platform == "win32":
+            import armyops_win
+            segs = armyops_win.fronts_towards(self, enemy_tag, tag)
+            return [{"front_ptr": hex(s["front"]), "front_handle": s["front_handle"],
+                     "section": s["section"],
+                     "border_provinces": s["border_provinces"]}
+                    for s in segs]
         import armyops
         segs = armyops.fronts_towards(self, enemy_tag, tag)
         return [{"front_ptr": hex(s["front"]), "front_handle": s["front_handle"],
@@ -2884,6 +3203,43 @@ class MacroMixin:
     def draw_front_line(self, orders_group, enemy_tag=None, front_ptr=None,
                         section=None, frm=0, to=100000, assign="proportional"):
         """Give an army a front line order. With enemy_tag, the WHOLE border is covered."""
+        if sys.platform == "win32":
+            # The PE build draws a front line by calling COrderNewRootCommand with
+            # a CFront* and a CPdxArray<CArmy*>; the Linux arm-then-verify dance
+            # (settle + poll for the queued order) does not apply, because the
+            # engine appends the order synchronously inside Post.
+            import armyops_win
+            divs = armyops_win.divisions_of(self, orders_group)
+            if front_ptr is not None:
+                fp = int(front_ptr, 16) if isinstance(front_ptr, str) else int(front_ptr)
+                ok, err, _cmd = armyops_win.draw_front_line(
+                    self, orders_group, fp, section, frm, to, divisions=divs)
+                return {"ok": ok, "error": err, "divisions": len(divs)}
+            if not enemy_tag:
+                return {"ok": False, "error": "enemy_tag or front_ptr is required"}
+            seen, res, new_ids = set(), [], []
+            for s in armyops_win.fronts_towards(self, enemy_tag):
+                fk = tuple(s["front_handle"])
+                if fk in seen:
+                    continue
+                seen.add(fk)
+                before = {o["id"] for o in armyops_win.orders(self, orders_group)}
+                ok, err, _cmd = armyops_win.draw_front_line(
+                    self, orders_group, s["front"], s["section"], frm, to,
+                    divisions=divs)
+                fresh = [o["id"] for o in armyops_win.orders(self, orders_group)
+                         if o["id"] not in before and o["id"] not in new_ids]
+                if ok and not fresh:
+                    ok = False
+                    err = "the command posted but no order appeared"
+                new_ids += fresh
+                res.append({"front": s["front_handle"], "section": s["section"],
+                            "ok": ok, "error": err,
+                            "weight": len(s["border_provinces"]),
+                            "new_orders": fresh})
+            return {"ok": all(r["ok"] for r in res) if res else True,
+                    "segments": res, "new_order_ids": new_ids,
+                    "divisions": len(divs)}
         import armyops
         res = []
         if front_ptr is not None:
@@ -3093,14 +3449,30 @@ class MacroMixin:
         return res
 
     def orders_of(self, orders_group):
+        if sys.platform == "win32":
+            import armyops_win
+            return armyops_win.orders(self, orders_group)
         import armyops
         return armyops.orders_of(self, orders_group)
 
     def execute_plan(self, orders_group, order_id=0):
         """Execute the battle plan (the green button in the UI)."""
+        if sys.platform == "win32":
+            import armyops_win
+            ok, err, _cmd = armyops_win.execute_plan(self, orders_group, order_id)
+            return {"ok": ok, "error": err}
         import armyops
         ok, err = armyops.execute_plan(self, orders_group, order_id)
         return {"ok": ok, "error": err}
+
+    def offensive_line(self, orders_group, parent_order_id, provinces, divisions=None):
+        """Draw an offensive line under one front order (the arrow inside the front)."""
+        if sys.platform == "win32":
+            import armyops_win
+            ok, err, _cmd = armyops_win.offensive_line(
+                self, orders_group, parent_order_id, provinces, divisions)
+            return {"ok": ok, "error": err}
+        raise NotImplementedError("offensive_line is Windows-only for now")
 
     def delete_order(self, orders_group, order_id):
         import armyops
@@ -3450,6 +3822,38 @@ class MacroMixin:
         import diplomacy
         import combat
         import time as _t
+        if sys.platform == "win32":
+            if dry_run:
+                # BUG-08 (playtest 2026-11-15): dry_run used to fall through to the
+                # real declaration -- a "probe" started the Dutch war. A dry run now
+                # only evaluates the player-side gate and posts nothing.
+                rd = self.war_readiness_check(target_tag)
+                return {"ok": bool(rd.get("ready")), "dry_run": True,
+                        "posted": 0, "target": target_tag,
+                        "readiness": rd,
+                        "note": "dry_run: no command was built or posted"}
+            # Real action channel on the PE build: CDeclareWarAction wrapped in a
+            # CDiplomaticActionCommand.  The availability gate (action+0x70) is
+            # bypassed, so war_readiness_check stays the only guard.
+            import cmdwin
+            c = self._c(target_tag)
+            r = cmdwin.declare_war(self, c.tag_id)
+            self._settle()
+            # combat.war_relations scans live CWarRelation objects, but the object
+            # index is a snapshot -- refresh=True is what makes a just-declared war
+            # visible (a full rescan costs ~25 s, hence one shot rather than a poll).
+            verified = None
+            if r.get("ok"):
+                try:
+                    _t.sleep(2.0)
+                    verified = target_tag.upper() in combat.enemy_tags(
+                        self, self.player_tag(), refresh=True)
+                except Exception:
+                    verified = None
+            return {"ok": bool(r.get("ok")), "posted": r.get("posted"),
+                    "target": target_tag, "target_id": c.tag_id,
+                    "action": r.get("act"), "cmd": r.get("cmd"),
+                    "at_war_verified": verified}
         cb = None if dry_run else diplomacy.find_wargoal(self, target_tag)
         ok, err = diplomacy.declare_war(self, target_tag, dry_run=dry_run)
         # 2026-11-13: CCommand::Run only queues the action, so a `true` return means
@@ -3594,9 +3998,14 @@ class MacroMixin:
         then succeeded / failed exactly the same way.
         """
         import api, commands
-        spec = commands.COMMANDS["SetNationalFocus"]
-        vt = self.va(spec["vt"])
-        can_fn = self.p.u64(vt + 0x50) - self.p.base
+        try:
+            spec = commands.COMMANDS["SetNationalFocus"]
+            vt = self.va(spec["vt"])
+            if vt < self.p.base or vt > self.p.base + 0x3900000:
+                return True          # platform without the Linux command vtable
+            can_fn = self.p.u64(vt + 0x50) - self.p.base
+        except OSError:
+            return True
         api.allow_call(can_fn)
         cmd = self.cmd.make("SetNationalFocus", tag=int(tag_id),
                             focus_ptr=int(focus_ptr))
@@ -3992,13 +4401,13 @@ for _n in dir(MacroMixin):
 # ============================================================================
 #  STATE DETAIL, DECISION AND IDEA DETAIL, AND ACTION WRAPPERS
 # ============================================================================
-ST_PROVINCES        = 0x08     # CPdxArray<CProvince*>
+ST_PROVINCES        = getattr(O, "ST_PROVINCES", 0x08)     # CPdxArray<CProvince*>
 ST_BUILDING_LEVELS  = 0x128    # 56-entry building level array
 ST_BUILDING_MAX     = 0x140
-ST_BUILDINGS        = 0x158    # CPdxArray<CBuilding*>, buildings in the state
-BG_LEVEL            = 0x40     # int16, building level
-ST_RESISTANCE       = 0x278    # int64 x1e5
-ST_COMPLIANCE       = 0x2A8    # int64 x1e5
+ST_BUILDINGS        = getattr(O, "ST_BUILDINGS", 0x158)    # CPdxArray<CBuilding*>
+BG_LEVEL            = getattr(O, "BG_LEVEL", 0x40)         # int16, building level
+ST_RESISTANCE       = getattr(O, "ST_RESISTANCE", 0x278)   # int64 x1e5, None = unknown
+ST_COMPLIANCE       = getattr(O, "ST_COMPLIANCE", 0x2A8)   # int64 x1e5, None = unknown
 
 
 class MacroMixin2:
@@ -4041,8 +4450,10 @@ class MacroMixin2:
                 "ptr": hex(s),
                 "buildings": blds,
                 "provinces": _count(p, s, ST_PROVINCES),
-                "resistance": round(p.i64(s + ST_RESISTANCE) / O.FIXED, 3),
-                "compliance": round(p.i64(s + ST_COMPLIANCE) / O.FIXED, 3),
+                "resistance": (round(p.i64(s + ST_RESISTANCE) / O.FIXED, 3)
+                               if ST_RESISTANCE else None),
+                "compliance": (round(p.i64(s + ST_COMPLIANCE) / O.FIXED, 3)
+                               if ST_COMPLIANCE else None),
                 "building_status_ptr": hex(s + 0x120),
             }
         raise KeyError("state not found: %s" % state_id)
@@ -4653,6 +5064,12 @@ class HandleMixin:
     def diplomatic_action_classes(self):
         """The game's 47 diplomatic action classes (CDiplomaticAction subclasses).
         CDiplomaticActionCommand carries one of them at +0x28."""
+        if sys.platform == "win32":
+            raise NotImplementedError(
+                "diplomatic_action_classes() walks Itanium RTTI typeinfo and .rela.dyn "
+                "in the Linux ELF. On hoi4.exe the equivalent needs the MSVC "
+                "TypeDescriptor table (research/windows/rtti_win.py) plus the base-class "
+                "chain, which is not implemented yet.")
         import rtti as _R
         from elf import ELF
         e = ELF(__import__("config").binary_path())

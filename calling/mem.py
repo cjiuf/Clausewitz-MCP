@@ -27,6 +27,22 @@ class Proc:
         """Address in the binary -> address in the running process."""
         return self.base + file_vaddr
 
+    def refresh_maps(self):
+        """Re-read the region list; a long campaign maps new arenas on the fly.
+
+        `self.maps` is a snapshot taken at attach time. ObjectIndex's fallback scan
+        calls this before walking every writable region, otherwise heap arenas
+        mmapped after attach are invisible (B4, review 2026-11-07). The Linux
+        backend has no such method -- its maps are already current.
+        """
+        fn = getattr(self.be, "refresh_maps", None)
+        if fn is not None:
+            try:
+                self.maps = fn()
+            except Exception:
+                pass
+        return self.maps
+
     # ---------- raw ----------
     def read(self, addr, size):
         return self.be.read(addr, size)
@@ -60,16 +76,34 @@ class Proc:
         i = b.find(b"\0")
         return b[:i if i>=0 else len(b)].decode("utf-8","replace")
 
+    _MSVC_STRING = sys.platform == "win32"
+
     def stdstring(self, addr):
-        """libstdc++ SSO std::string @addr -> str"""
+        """std::string @addr -> str.
+
+        MSVC (Windows): { char buf[16]; size_t size; size_t cap; }
+        libstdc++ (Linux): { char* p; size_t n; char sso[16]; }
+        Both are 0x20 bytes but the fields sit in different places.
+        """
         d = self.try_read(addr, 32)
-        if not d or len(d) < 32: return None
+        if not d or len(d) < 32:
+            return None
+        if self._MSVC_STRING:
+            n, cap = struct.unpack_from("<QQ", d, 0x10)
+            if n > 0x10000 or cap > 0x10000:
+                return None
+            if cap <= 15:                       # SSO
+                return d[:n].decode("utf-8", "replace")
+            p = struct.unpack_from("<Q", d, 0)[0]
+            b = self.try_read(p, n)
+            return b.decode("utf-8", "replace") if b else None
         p, n = struct.unpack_from("<QQ", d, 0)
-        if n > 0x10000: return None
+        if n > 0x10000:
+            return None
         if p == addr + 16:            # SSO
-            return d[16:16+n].decode("utf-8","replace")
+            return d[16:16+n].decode("utf-8", "replace")
         b = self.try_read(p, n)
-        return b.decode("utf-8","replace") if b else None
+        return b.decode("utf-8", "replace") if b else None
 
     # ---------- write ----------
     def write(self, addr, data):

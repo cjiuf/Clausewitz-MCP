@@ -8,9 +8,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Hearts%20of%20Iron%20IV-1.19.4.1.99a5-2b3440?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Hearts%20of%20Iron%20IV-1.19.5.0-2b3440?style=for-the-badge">
+  <img src="https://img.shields.io/badge/platform-Windows%20x64-3d6b4a?style=for-the-badge">
   <img src="https://img.shields.io/badge/MCP-2024--11--05-c8a04a?style=for-the-badge">
-  <img src="https://img.shields.io/badge/tools-149-2b3440?style=for-the-badge">
+  <img src="https://img.shields.io/badge/tools-153-2b3440?style=for-the-badge">
   <img src="https://img.shields.io/badge/dependencies-1-3d6b4a?style=for-the-badge">
   <img src="https://img.shields.io/badge/license-MIT-2b3440?style=for-the-badge">
 </p>
@@ -25,21 +26,25 @@
 
 ---
 
-> ### Fork note — `1.19.4.1.99a5`
+> ### Fork note — `1.19.5.0` (Windows x64)
 >
-> This is a fork of [smerss/Clausewitz-MCP](https://github.com/smerss/Clausewitz-MCP)
-> that tracks the **Linux x64** build of Hearts of Iron IV **1.19.4.1.99a5**
-> (Operation Postern) instead of 1.19.2. The upstream design is unchanged: reads come
-> from the live process, every action goes through `CCommandQueue` and is still checked
-> by the game's own `CanExecute`.
+> This is a fork of [smerss/Clausewitz-MCP](https://github.com/smerss/Clausewitz-MCP).
+> It tracks the **Steam Windows build of Hearts of Iron IV 1.19.5.0**
+> (`Operation Postern v1.19.5.0.7c6c (c184)`) instead of the Linux build upstream
+> targets. The upstream design is unchanged: reads come from the live process, every
+> action goes through `CCommandQueue` and is still checked by the game's own
+> `CanExecute`.
 >
-> It adds **42 tools (107 → 149)**, ~14k lines of game logic, a complete 1.19.4.1
-> offset/table set, and a batch of upstream bug fixes. See the
-> [`1.19.4.1.99a5` release](https://github.com/cjiuf/Clausewitz-MCP/releases) for the
-> full list.
+> It adds **46 tools (107 → 153)**, a complete 1.19.5.0 offset/table set, MSVC RTTI, a
+> PE command catalogue and a thread-hijack injector. See the
+> [`1.19.5.0` release](https://github.com/cjiuf/Clausewitz-MCP/releases) for the full
+> list.
 >
-> Still **Linux only** — the offset tables are ELF virtual addresses. A Windows port
-> needs `calling/process/windows.py` plus every table re-derived from `hoi4.exe`.
+> **This is a port, not a verified release.** The read side was re-derived field by
+> field against the live process; the action side is wired end to end but most tools
+> have never been run in a real campaign, so availability is not guaranteed. The Linux
+> path (1.19.4.1.99a5) is untouched and still works. See
+> [Windows (1.19.5.0)](#windows-11950) below.
 
 ---
 
@@ -79,6 +84,15 @@ pip install -r requirements.txt     # numpy, that's the whole list
 python3 clausewitz.py doctor
 ```
 
+On Windows the same lines work in PowerShell (`python` instead of `python3`):
+
+```powershell
+git clone https://github.com/cjiuf/Clausewitz-MCP
+cd Clausewitz-MCP
+pip install -r requirements.txt
+python clausewitz.py doctor
+```
+
 `doctor` looks for your install in the usual Steam places, in extra Steam library
 drives, and in WSL mounts. If it comes up empty, point it yourself:
 
@@ -86,11 +100,20 @@ drives, and in WSL mounts. If it comes up empty, point it yourself:
 export HOI4_PATH="$HOME/.steam/steam/steamapps/common/Hearts of Iron IV"
 ```
 
-Reading another process needs permission. Run as root, or do this once per boot:
+```powershell
+$env:HOI4_PATH = "C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV"
+```
+
+Reading another process needs permission. On Linux run as root, or do this once per
+boot:
 
 ```bash
 sudo sysctl -w kernel.yama.ptrace_scope=0
 ```
+
+On Windows, `OpenProcess`/`ReadProcessMemory` need the tool host and the game to run at
+the same integrity level — start the MCP server from an elevated shell if the game is
+elevated (or neither).
 
 Then add it to your MCP client:
 
@@ -120,7 +143,7 @@ More examples in [`mcp/config/`](mcp/config/).
 
 ## What it does
 
-107 tools covering focus tree, research, production, construction, politics, decisions,
+153 tools covering focus tree, research, production, construction, politics, decisions,
 diplomacy, armies, fleets, templates and save analysis. Most of that is plumbing. The
 interesting parts are below.
 
@@ -239,9 +262,10 @@ python3 clausewitz.py tables
 
 ## Safety
 
-Reads never stop the game. Calls do, because on Linux they ptrace-stop all 28 threads and
-hijack the main one, so anything running in a loop is read-only and only drops that guard
-to post a batch of orders inside a single attach.
+Reads never stop the game. Calls do: on Linux they ptrace-stop all 28 threads and hijack
+the main one; on Windows they suspend the owning thread, rewrite its context, run the
+call and restore it. Either way anything running in a loop is read-only and only drops
+that guard to post a batch of orders inside a single attach.
 
 Three rules live in the code. Each one cost something:
 
@@ -256,29 +280,81 @@ than the rule.
 
 ---
 
+## Windows (1.19.5.0)
+
+The Steam Windows build is **1.19.5.0**, a different binary from the Linux
+**1.19.4.1.99a5** one, so it needs its own offset table. That table now exists:
+`calling/offsets_win.py`, selected automatically by `calling/offsets.py` on `win32`.
+
+Two layers, and they are not at the same level of proof:
+
+* **Reads** were re-derived field by field and cross-checked against the live process —
+  game state, countries, states, buildings, manpower, modifiers, the focus tree, research.
+* **Writes** all go through one generic command layer: `calling/pecmd.py` recovers the
+  `C*Command` catalogue out of `hoi4.exe`, `calling/cmdwin.py` builds a command through
+  its real constructor and posts it to `CCommandQueue`. Only the families listed below
+  have actually been fired in a running game.
+
+Working today:
+
+| piece | status |
+|---|---|
+| `calling/process/windows.py` | `OpenProcess` + `VirtualQueryEx` + `ReadProcessMemory`/`WriteProcessMemory`; 255 MB/s reads |
+| MSVC RTTI | `research/windows/rtti_win.py` recovers **19 706 types / 16 567 vtables / 15 141 classes** in 0.5 s |
+| gamestate | `g_gameState` → `CCurrentGameState`; `GS_COUNTRIES` = 0x310 (440 countries), `GS_TAG2INDEX` = 0x340 |
+| countries | `CCountry` size 0x1710, tag id at +0x08, localised name at +0x10, states at +0x460 |
+| states | `CState` owner/controller at +0xC8 / +0xCC |
+| political power | `CPoliticalStatus` + 0xE0, verified by differential scan |
+| console | all **370** commands decoded from the inline table at RVA 0x33DD968 (stride 0x1C8, same as Linux); command ABI `SResult* fn(SResult*, const CPdxArray<CString>*)` verified live — `pp 7` grants exactly +7 |
+| `g.console()` | **works** — `consolecmd.py` has a Windows path, so `pp`, `manpower`, `xp`, `add_equipment`, `add_stability` and the aliases (`ae`, `political_power`, `wp`) all run from Python at 3-10 ms per call |
+| tags | `GS_TAG_DB` = gamestate+0x358, an inline `CPdxArray<std::string>` (443 entries incl. the dynamic `D01..D03`), so `country("GER")` / `country("INS")` resolve; `GS_PLAYER_TAG` = 0x520 |
+| injection | `calling/process/winject.py` — hijack a running thread, run a stub that sets the arguments and calls the target, restore the saved context. 60 back-to-back `pp` calls verified in one attach; see `research/WINDOWS_1.19.5.md` §12 |
+| command catalogue | `calling/pecmd.py` recovers **380 of the 405** `C*Command` classes straight from `hoi4.exe` (vtable → constructor → field offsets, field sizes, which argument each field comes from), cached to `calling/pecmds.pkl`. `calling/cmdwin.py` builds any of them with the real constructor, checks the vtable back, swaps in a no-op destructor and enqueues — the same path a button click takes |
+| MCP tools | 29 read tools answer from the live process (`HANDLERS[name](args)` — the same entry point the transport uses) |
+| army orders | `hoi4_army_battleplans` builds the real order tree on hoi4.exe: `armyops_win` does create_army / front line / offensive line / execute / arrow `+0x248`, and `game.py` dispatches every army method to it. Verified taking ground: 21 of the Netherlands' 25 provinces, then capitulation (pass `wait_seconds=600` to have the call wait for it). The plan must be built while the game is running — a paused game yields a child with `assigned == 0` (§70.2) |
+| peace conference | `hoi4_peace_status` / `hoi4_peace_demands` / `hoi4_peace_finish`: states, puppet and take-navy demands all applied by the engine. Take-navy moved 6 of Denmark's 7 ships — one fleet per action (§69) |
+| focus / research writes | `hoi4_set_focus` / `hoi4_drop_focus` / `hoi4_start_research` build the real command objects and queue them. `CDropCurrentNationalFocusCommand` was re-derived from RTTI + its vtable (`0x2A12988` → ctor `0x11CE6F0`, `(cmd, CCountryTag*)`, size 0x30); two set→drop cycles ran clean. `hoi4_research` reports a real percentage and days left: progress is `CTechnology+0x198 / 1e5` research-days against `CTechnologyTemplate+0x3E0 / 1000` total days (§72) |
+
+Still open: `tag <TAG>` takes ~20 s (it reloads the player country) and needs the
+long-poll path described in §15, and an offensive line drawn by the tool has not yet
+been watched taking ground — the order tree is right, the divisions were still
+marching (§70.4). Everything the generic command layer covers but the table above does
+not name — production lines, division training, army moves, ideas and laws — is built
+and unit-checked but has never been run against a live campaign. Full write-up and the
+reproducible probes: [`research/WINDOWS_1.19.5.md`](research/WINDOWS_1.19.5.md) and
+[`research/windows/`](research/windows/).
+
+---
+
 ## Roadmap
 
-- [x] Live state reads, 107 MCP tools
+- [x] Live state reads, 153 MCP tools
 - [x] Player command channel with the game's own legality checks
 - [x] Combat read from the game's damage output
 - [x] Terrain, rivers, forts, stacking and combat width in the planner
 - [x] Encirclement search over the province graph
 - [x] Turn loop with wake-on-event
-- [ ] **Windows port. At 50 ⭐ I'll build it.** The framework doesn't care about the OS.
-      What's missing is a PE backend (`ReadProcessMemory`, `CreateRemoteThread`) and,
-      the slower half, regenerating every offset table against `hoi4.exe`, since all of
-      them came out of the Linux ELF.
+- [x] **Windows port** (branch `feat/windows-backend`, target build 1.19.5.0): PE backend
+      (`ReadProcessMemory` / thread hijack), every offset table re-derived from
+      `hoi4.exe`, MSVC RTTI, and a PE command catalogue that recovers the constructor and
+      argument layout of 380 `C*Command` classes.
+- [ ] **Exercising the port.** 25 command classes carry a hand-checked argument spec;
+      the other 355 are recovered but have never been built against a live game.
 - [ ] Air and navy micro. The commands are extracted; none have been fired in anger.
-- [ ] Peace conference automation
-
-Linux only today. That's a fact about the offset tables, not about the design.
+- [x] Peace conference automation (Windows backend: `calling/peacewin.py`.
+      `hoi4_peace_demands` reproduces the window's select-all + 提交要求 by writing a
+      `CPeaceBiddingTurn` into `CPeaceConference+0x1F8`; verified live by taking all five
+      Dutch states in 11 game days -- see `research/WINDOWS_1.19.5.md` §62-63.)
 
 ---
 
 ## Contributing
 
-The Windows port is the most useful thing anyone could pick up, and it's self-contained.
-[`research/README.md`](research/README.md) spells out both halves.
+The Windows side is where the work is: every command family in
+`calling/tables/commands.txt` that is not in the verified list above needs a real game
+session behind it. [`research/README.md`](research/README.md) explains how the tables are
+derived; [`research/WINDOWS_1.19.5.md`](research/WINDOWS_1.19.5.md) has the 1.19.5.0
+version, including the command-layer design.
 
 After that, the unwrapped command areas. Division templates (25 commands), air missions
 (35), navy (42), intelligence (20). All of them are extracted with their parameter

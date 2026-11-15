@@ -11,6 +11,7 @@ works. This module uses the same path: not a cheat, the player's own action chan
 """
 from __future__ import annotations
 import struct
+import sys
 
 IDLER_GLOBAL   = 0x459E908
 IDLER_VT_QUEUE = 0x90     # CInGameIdler::GetCommandQueue()
@@ -186,6 +187,13 @@ class CommandLayer:
         return self.g.call(fn, (idl,), absolute=True)
 
     def new(self, size: int) -> int:
+        # FN_NEW is a Linux VA. On the PE build this jumps into unrelated code
+        # and kills the process (measured 2026-11-14); the Windows path allocates
+        # from the game's own CPdxNewDeleteAllocator singleton instead, which is
+        # exactly what cmdwin does for the commands it builds by hand.
+        if sys.platform == "win32":
+            import cmdwin
+            return cmdwin.alloc(self.g, int(size))
         return self.g.call(FN_NEW, (size,))
 
     def _alloc_stdstring(self) -> int:
@@ -232,6 +240,15 @@ class CommandLayer:
         does CanExecute -> Post internally, so calling Run is both correct and
         the same path a player's click takes.
         """
+        if sys.platform == "win32":
+            # PE: CCommand::Run does not exist at this address, and Post's drop
+            # paths call the command's deleting destructor.  `enqueue` stamps the
+            # session tick/seq and hands the object straight to the queue, the
+            # same route every working cmdwin command takes.
+            import cmdwin
+            rv = cmdwin.enqueue(self.g, cmd_ptr)
+            self.last_error = ""
+            return rv
         if force:
             # Forced posts bypass CanExecute; Run would refuse them.
             return self.g.call(FN_POST, (self.queue(), cmd_ptr, force))
@@ -311,6 +328,26 @@ class CommandLayer:
     def send_raw(self, name: str, fields: dict, force=0):
         """Build ANY CCommand and post it to the queue.
         fields: {"tag":1, "0x28": <value>, ...}  (offset keys may be hex strings)"""
+        if sys.platform == "win32":
+            import cmdwin
+            named = {k: v for k, v in fields.items()
+                     if not (isinstance(k, str) and (k.startswith("0x") or k.isdigit()))}
+            offs = {k: v for k, v in fields.items() if k not in named}
+            if named or not offs:
+                cmd = cmdwin.build_command(self.g, name, named)
+            else:
+                spec = cmdwin.spec_of(name)
+                blob_fields = []
+                for k, v in offs.items():
+                    off = int(str(k), 16) if str(k).startswith("0x") else int(k)
+                    hit = [f for f in spec["fields"] if f["offset"] == off]
+                    sz = hit[0]["size"] if hit else 8
+                    blob_fields.append((off, {8: "<Q", 4: "<i", 2: "<h",
+                                              1: "<B"}[sz], int(v)))
+                cmd = cmdwin.build_by_vt(self.g, spec["vt"], spec["size"], blob_fields)
+            rv = self.post(cmd, force)
+            return {"command": name, "ptr": hex(cmd), "run_result": rv & 0xFF,
+                    "error": getattr(self, "last_error", "")}
         spec, src = self.spec_for(name)
         size = spec["size"] or 0x80
         ptr = self.new(size)
@@ -359,6 +396,11 @@ class CommandLayer:
     # ------------------------------------------------------- generic builder
     def make(self, name: str, **fields):
         """Build a command object directly, without calling its constructor."""
+        if sys.platform == "win32":
+            # PE build: the layout (and often the constructor itself) comes from
+            # `pecmd`, recovered out of MSVC RTTI + the ctor's own stores.
+            import cmdwin
+            return cmdwin.build_command(self.g, name, fields)
         spec = COMMANDS[name]
         ptr = self.new(spec["size"])
         blob = bytearray(spec["size"])   # all-zero: no stale heap in padding fields
@@ -399,6 +441,13 @@ class CommandLayer:
     # ---------------------------------------------------------- convenience
     def set_national_focus(self, focus_ptr: int, tag_id: int = None):
         """Select a national focus for the player, or for the given tag."""
+        if sys.platform == "win32":
+            # The PE build keeps the same command objects but different addresses;
+            # cmdwin builds through the real constructor and posts through the
+            # session's Post (see calling/cmdwin.py).
+            import cmdwin
+            tid = self.g.player_tag_id() if tag_id is None else int(tag_id)
+            return cmdwin.set_national_focus(self.g, focus_ptr, tid)
         if tag_id is None:
             tagp = self.player_tag_ptr()
         else:

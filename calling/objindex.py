@@ -19,7 +19,7 @@ MEMORY (this file used to OOM-kill the machine):
     with it, the ptrace-attached game.
 """
 from __future__ import annotations
-import os, pickle, re, struct
+import os, pickle, re, struct, sys
 from array import array
 import numpy as np
 
@@ -90,6 +90,39 @@ class ObjectIndex:
 
     # ------------------------------------------------------------------ scanning
     def _rss_mb(self):
+        if sys.platform == "win32":
+            # GetProcessMemoryInfo on our own process. The scan is the only place in
+            # the stack that can grow to gigabytes, and the Linux build relies on this
+            # number to abort instead of being OOM-killed; without it a Windows scan
+            # had no ceiling at all.
+            try:
+                import ctypes
+                import ctypes.wintypes as wt
+
+                class PMC(ctypes.Structure):
+                    _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD),
+                                ("PeakWorkingSetSize", ctypes.c_size_t),
+                                ("WorkingSetSize", ctypes.c_size_t),
+                                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                                ("PagefileUsage", ctypes.c_size_t),
+                                ("PeakPagefileUsage", ctypes.c_size_t)]
+                pmc = PMC()
+                pmc.cb = ctypes.sizeof(PMC)
+                psapi = ctypes.WinDLL("psapi")
+                k32 = ctypes.WinDLL("kernel32")
+                k32.GetCurrentProcess.restype = ctypes.c_void_p
+                psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p,
+                                                       ctypes.POINTER(PMC),
+                                                       ctypes.c_ulong]
+                if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(),
+                                              ctypes.byref(pmc), pmc.cb):
+                    return int(pmc.WorkingSetSize) // (1024 * 1024)
+            except Exception:
+                pass
+            return 0
         try:
             with open("/proc/self/status") as fh:
                 for line in fh:
@@ -160,11 +193,30 @@ class ObjectIndex:
     @staticmethod
     def _trim():
         """Return freed pages to the OS so the RSS does not creep up."""
+        if sys.platform == "win32":
+            return                      # ReadProcessMemory leaks nothing; no libc here
         try:
             import ctypes
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
+
+    def _rtti_keys(self, class_name: str):
+        """RTTI keys for a class name, in whichever mangling this build uses.
+
+        Linux  : the Itanium name is length-prefixed -> "22CNationalFocusDatabase"
+        Windows: the MSVC name is reduced to plain         -> "CNationalFocusDatabase"
+
+        `instances()` accepts either spelling (with or without the length prefix),
+        so a caller never has to know which build it is running against.
+        """
+        if class_name in self.rtti:
+            return [class_name]
+        plain = re.sub(r"^\d+", "", class_name)
+        if plain in self.rtti:
+            return [plain]
+        cands = [c for c in self.rtti if re.fullmatch(r"\d+" + re.escape(plain), c)]
+        return cands[:1]
 
     # ------------------------------------------------------------------ queries
     # Classes whose instances are CREATED MID-GAME. The index is a snapshot taken
@@ -192,13 +244,11 @@ class ObjectIndex:
         return out
 
     def _live_scan(self, class_name: str, max_hits: int = 5000):
-        key = class_name
-        if not re.match(r"^\d", key):
-            cands = [c for c in self.rtti if re.fullmatch(r"\d+" + re.escape(key), c)]
-            if not cands:
-                return []
-            key = cands[0]
-        vptrs = [np.uint64(self.p.va(v)) for v in self.rtti.get(key, [])]
+        keys = self._rtti_keys(class_name)
+        if not keys:
+            return []
+        vptrs = [np.uint64(self.p.va(v))
+                 for k in keys for v in self.rtti.get(k, [])]
         if not vptrs:
             return []
         want = set(int(v) for v in vptrs)
@@ -267,13 +317,11 @@ class ObjectIndex:
         hit = cache.get(class_name)
         if hit and _t.time() - hit[0] < ttl:
             return list(hit[1])
-        key = class_name
-        if not re.match(r"^\d", key):
-            cands = [c for c in self.rtti if re.fullmatch(r"\d+" + re.escape(key), c)]
-            if not cands:
-                return []
-            key = cands[0]
-        want = [np.uint64(self.p.va(v)) for v in self.rtti.get(key, [])]
+        keys = self._rtti_keys(class_name)
+        if not keys:
+            return []
+        want = [np.uint64(self.p.va(v))
+                for k in keys for v in self.rtti.get(k, [])]
         if not want:
             return []
         try:
@@ -329,15 +377,10 @@ class ObjectIndex:
         if plain in self.DYNAMIC_CLASSES:
             return self.live_instances(plain)
         m = self._sanitised()
-        key = class_name
-        if not re.match(r"^\d", key):
-            cands = [c for c in self.rtti if re.fullmatch(r"\d+" + re.escape(key), c)]
-            if not cands:
-                return []
-            key = cands[0]
         res = []
-        for v in self.rtti.get(key, []):
-            res.extend(m.get(self.p.va(v), []))
+        for key in self._rtti_keys(class_name):
+            for v in self.rtti.get(key, []):
+                res.extend(m.get(self.p.va(v), []))
         return sorted(set(res))
 
     def singleton(self, class_name: str):

@@ -389,6 +389,71 @@ def capital_provinces(g):
     return out
 
 
+def _win_controller_map(g, divisions=None):
+    """1.19.5 province -> controller tag.
+
+    The Linux path walked CProvince objects looking for a CState pointer at
+    +0xE0 and a CControllerArea at +0xF0. On the PE build a province carries a
+    COwnerArea at +0xD8 and a CControllerArea at +0xD0, and no CState pointer,
+    so `province_objects()` (a fixed Linux vtable scan) found nothing and every
+    caller saw an empty map -- `front_changes()` reported provinces_seen=0.
+
+    Occupation in HOI4 flips the *state* controller (CState+0xCC), so this reads
+    that and expands each state to its provinces. Per-province combat occupation
+    within a contested state follows the state controller until the state flips.
+    """
+    import struct as _st
+    p = g.p
+    try:
+        g._load_tags()
+        tags, t2i = g._tags, g._tag2idx
+    except Exception:
+        tags, t2i = [], {}
+
+    def tag_of(idx):
+        try:
+            return tags[t2i[idx]]
+        except Exception:
+            return None
+
+    out = {}
+    try:
+        gs = g.gamestate
+        arr = p.u64(gs + 0x2C8)          # GS_STATES, CPdxArray<CState*>
+        n = p.i32(gs + 0x2C8 + 0xC)
+    except Exception:
+        return out
+    for i in range(max(0, min(n, 4000))):
+        try:
+            st = p.u64(arr + 8 * i)
+            if not st:
+                continue
+            ctl = p.i32(st + 0xCC) or p.i32(st + 0xC8)
+            t = tag_of(ctl)
+            if not t:
+                continue
+            pa = p.u64(st + 0x18)        # ST_PROVINCES
+            pn = p.i32(st + 0x18 + 0xC)
+            if not pa or not (0 < pn <= 400):
+                continue
+            for k in range(pn):
+                pr = p.u64(pa + 8 * k)
+                if pr:
+                    out[p.i32(pr + 0xA4)] = t
+        except Exception:
+            continue
+    if divisions:
+        seen = {}
+        for r in divisions:
+            pv, tag = r.get("prov"), r.get("tag")
+            if pv is not None and tag:
+                seen.setdefault(pv, set()).add(tag)
+        for pv, ts in seen.items():
+            if len(ts) == 1:
+                out[pv] = next(iter(ts))
+    return out
+
+
 def province_controller_map(g, divisions=None):
     """province_id -> controller tag, LIVE (civil-war occupation included).
 
@@ -412,6 +477,9 @@ def province_controller_map(g, divisions=None):
          tag present is forced to that tag (handles freshly occupied ground
          before the area pointer updates).
     """
+    import sys as _sys
+    if _sys.platform == "win32":
+        return _win_controller_map(g, divisions)
     from collections import Counter
     owners, _ = province_owner_map(g)
     ptrs = province_objects(g)
