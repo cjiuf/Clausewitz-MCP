@@ -295,7 +295,6 @@ Two layers, and they are not at the same level of proof:
   its real constructor and posts it to `CCommandQueue`. Only the families listed below
   have actually been fired in a running game.
 
-Working today:
 
 | piece | status |
 |---|---|
@@ -320,8 +319,7 @@ long-poll path described in §15, and an offensive line drawn by the tool has no
 been watched taking ground — the order tree is right, the divisions were still
 marching (§70.4). Everything the generic command layer covers but the table above does
 not name — production lines, division training, army moves, ideas and laws — is built
-and unit-checked but has never been run against a live campaign. Full write-up and the
-reproducible probes: [`research/WINDOWS_1.19.5.md`](research/WINDOWS_1.19.5.md) and
+and unit-checked but has never been run against a live campaign. Full write-up: [`research/WINDOWS_1.19.5.md`](research/WINDOWS_1.19.5.md) and
 [`research/windows/`](research/windows/).
 
 ---
@@ -342,7 +340,7 @@ reproducible probes: [`research/WINDOWS_1.19.5.md`](research/WINDOWS_1.19.5.md) 
       the other 355 are recovered but have never been built against a live game.
 - [ ] Air and navy micro. The commands are extracted; none have been fired in anger.
 - [x] Peace conference automation (Windows backend: `calling/peacewin.py`.
-      `hoi4_peace_demands` reproduces the window's select-all + 提交要求 by writing a
+      `hoi4_peace_demands` reproduces the window's select-all by writing a
       `CPeaceBiddingTurn` into `CPeaceConference+0x1F8`; verified live by taking all five
       Dutch states in 11 game days -- see `research/WINDOWS_1.19.5.md` §62-63.)
 
