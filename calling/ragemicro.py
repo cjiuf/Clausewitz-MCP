@@ -88,7 +88,14 @@ class RageMicro:
         self._ema, self._peak, self._tmpl_peak = {}, {}, {}
         self._last_clock = None      # game clock; if it has not moved, do not sample
         self._clock_frozen = 0
-        self._ordered = {}       # division -> (province, kind): avoid repeating an order
+        self._ordered = {}       # division -> (province, kind, clock_h, ok): dedupe orders
+        # A repeat guard that never expires is a trap: a division that is destroyed,
+        # retreats, or whose order the engine refused keeps its entry forever, and the
+        # next order aimed at the same (province, kind) is skipped for good. So every
+        # entry carries the clock it was written at and expires; refusals expire faster
+        # than successes so a rejected order is retried soon, just not every tick.
+        self.order_ttl_hours = 48
+        self.order_fail_ttl_hours = 6
         self._me = None          # played country; the engine stops if it changes
         self._pocket_since = {}  # pocket -> hour it was cut off
         self._skips = []         # why we declined each attack
@@ -109,6 +116,33 @@ class RageMicro:
             return self.g.date()["raw"]
         except Exception:
             return None
+
+    def _already_ordered(self, d, prov, kind, clk):
+        """True if this identical order is still fresh. Expired entries are dropped."""
+        e = self._ordered.get(d)
+        if not e:
+            return False
+        p0, k0, t0, ok0 = e
+        ttl = self.order_ttl_hours if ok0 else self.order_fail_ttl_hours
+        if clk is not None and t0 is not None and (clk - t0) > ttl:
+            del self._ordered[d]
+            return False
+        return (p0, k0) == (prov, kind)
+
+    def _prune_orders(self, clk):
+        """Drop entries whose division is gone, and the oldest ones past twice their ttl."""
+        if len(self._ordered) > 4096:                 # hard ceiling, ~100 KB
+            self._ordered.clear()
+            return
+        if clk is None:
+            return
+        dead = []
+        for d, (p0, k0, t0, ok0) in self._ordered.items():
+            ttl = self.order_ttl_hours if ok0 else self.order_fail_ttl_hours
+            if t0 is not None and (clk - t0) > 2 * ttl:
+                dead.append(d)
+        for d in dead:
+            del self._ordered[d]
 
     def _smooth(self, key, value):
         if self._clock_frozen:       # game paused: re-sampling the same numbers would
@@ -488,6 +522,7 @@ class RageMicro:
         clk = self._clock()
         self._clock_frozen = (clk is not None and clk == self._last_clock)
         self._last_clock = clk
+        self._prune_orders(clk)
         if self._clock_frozen:
             self.stats["last_reason"] = "game paused - no samples taken"
         done = []
@@ -505,14 +540,18 @@ class RageMicro:
         try:
             for a in acts:
                 d, prov = a["division"], a["province"]
-                if self._ordered.get(d) == (prov, a["kind"]):
+                clk = self._last_clock
+                if self._already_ordered(d, prov, a["kind"], clk):
                     continue                  # do not repeat an identical order
                 try:
                     ok, err = unitorders.move(self.g, d, prov)
                 except Exception as e:
                     ok, err = False, "hata: %s" % e
+                # Refusals are recorded too, with a short ttl. Retrying a rejected
+                # order on every tick burns the attach budget; never retrying it is
+                # what used to strand the division.
+                self._ordered[d] = (prov, a["kind"], clk, bool(ok))
                 if ok:
-                    self._ordered[d] = (prov, a["kind"])
                     self.stats.setdefault(a["kind"] + "s", 0)
                     self.stats[a["kind"] + "s"] += 1
                 else:

@@ -20,6 +20,7 @@ MEMORY (this file used to OOM-kill the machine):
 """
 from __future__ import annotations
 import os, pickle, re, struct, sys
+import time as _time
 from array import array
 import numpy as np
 
@@ -37,6 +38,26 @@ class ObjectIndex:
         # Signature of the binary the cache belongs to: the RTTI vtable set.
         flat = sorted(v for vps in rtti_map.values() for v in vps)
         self.sig = (len(flat), sum(flat))
+        # The cache used to be keyed on (build, pid) only, which says nothing about the
+        # heap: a session allocates new divisions, states change hands, armies spawn, and
+        # an index scanned an hour ago simply does not contain them.  So the cache also
+        # carries the time it was written and the shape of the writable map, and a
+        # mismatch in either forces a rescan.  ttl_s=0 disables the age check.
+        self.ttl_s = 600
+        self.built_at = None
+        self.regions_digest = None
+        self._seen_regions = set()
+
+    # ------------------------------------------------------------- heap shape
+    def _regions_digest(self):
+        """A cheap fingerprint of the writable map: count, total bytes, highest end."""
+        try:
+            regs = self.p.regions(writable=True)
+        except Exception:
+            return None
+        if not regs:
+            return None
+        return (len(regs), sum(r["end"] - r["start"] for r in regs), max(r["end"] for r in regs))
 
     # ------------------------------------------------------------------ cache
     def _to_rel(self, m):
@@ -71,9 +92,16 @@ class ObjectIndex:
             return None                      # different binary build
         if data.get("pid") != self.p.pid:
             return None                      # different game process
+        ts = data.get("ts")
+        if self.ttl_s and ts and (_time.time() - ts) > self.ttl_s:
+            return None                      # too old to trust: the heap has moved on
+        if data.get("regions") is not None and data.get("regions") != self._regions_digest():
+            return None                      # writable map changed shape -> rescan
         rel = data.get("rel")
         if rel is None:
             return None
+        self.built_at = ts
+        self.regions_digest = data.get("regions")
         return self._from_rel(rel)
 
     def _save_cache(self):
@@ -83,6 +111,9 @@ class ObjectIndex:
             tmp = self.cache_path + ".tmp"
             with open(tmp, "wb") as f:
                 pickle.dump({"sig": self.sig, "pid": self.p.pid,
+                             "ts": _time.time(),
+                             "regions": self.regions_digest,
+                             "n": len(self._byvptr or {}),
                              "rel": self._to_rel(self._byvptr)}, f)
             os.replace(tmp, self.cache_path)
         except Exception:
@@ -149,6 +180,7 @@ class ObjectIndex:
         lo, hi = int(targets[0]), int(targets[-1])
         out = {}
         regions = self.p.regions(writable=True)
+        self._seen_regions = {(r["start"], r["end"]) for r in regions}
         CH = 4 << 20
         aborted = False
         for ri, m in enumerate(regions):
@@ -186,8 +218,60 @@ class ObjectIndex:
                     aborted = True
                     break
         self._byvptr = out
+        self.built_at = _time.time()
+        self.regions_digest = self._regions_digest()
         if not aborted:
             self._save_cache()
+        return self._byvptr
+
+    def refresh(self):
+        """Top up the index with objects that were allocated after the last scan.
+
+        Only writable regions that did not exist (or were not scanned) last time are
+        read, so this is proportional to what the game has grown, not to its total
+        address space.  New hits are merged into the existing per-vtable arrays; no
+        address is ever dropped here, because a destroyed object's slot is harmless
+        while a missing live one is not -- callers that need certainty check the
+        object's vptr (`class_of`).
+        """
+        if self._byvptr is None:
+            return self.build()
+        targets = np.array(sorted(self._vptr_class), dtype=np.uint64)
+        lo, hi = int(targets[0]), int(targets[-1])
+        try:
+            regions = self.p.regions(writable=True)
+        except Exception:
+            return self._byvptr
+        new = [r for r in regions if (r["start"], r["end"]) not in self._seen_regions]
+        CH = 4 << 20
+        added = 0
+        for m in new:
+            a = m["start"]
+            while a < m["end"]:
+                n = min(CH, m["end"] - a)
+                n -= n % 8
+                if n <= 0:
+                    break
+                buf = self.p.try_read(a, n)
+                if buf and len(buf) >= 8:
+                    arr = np.frombuffer(buf[: len(buf) - len(buf) % 8], dtype=np.uint64)
+                    cand = np.nonzero((arr >= lo) & (arr <= hi))[0]
+                    if cand.size:
+                        vals = arr[cand]
+                        idx = np.clip(np.searchsorted(targets, vals), 0, targets.size - 1)
+                        good = targets[idx] == vals
+                        for off, v in zip(cand[good], vals[good]):
+                            lst = self._byvptr.setdefault(int(v), array("q"))
+                            lst.append(a + int(off) * 8)
+                            added += 1
+                    del arr
+                a += n
+        self._seen_regions.update((r["start"], r["end"]) for r in new)
+        self.built_at = _time.time()
+        self.regions_digest = self._regions_digest()
+        self.stats = getattr(self, "stats", {})
+        self.stats["refresh_added"] = self.stats.get("refresh_added", 0) + added
+        self.stats["refresh_regions"] = len(new)
         return self._byvptr
 
     @staticmethod
@@ -365,12 +449,32 @@ class ObjectIndex:
         """
         m = self.build()
         if getattr(self, "_sane", False):
+            self._maybe_refresh()
             return m
         self._sane = True
         if len(m) < 8000:
             m = self.build(force=True)
         return m
 
+    def _maybe_refresh(self):
+        """Keep the index from ageing out of truth.
+
+        Half a ttl in, read the regions the game has grown since the scan (cheap).
+        A full ttl in, rescan outright: most allocations reuse existing heap, so a
+        region-level top-up alone would keep missing them.
+        """
+        if not self.ttl_s or not self.built_at:
+            return
+        age = _time.time() - self.built_at
+        if age < self.ttl_s / 2:
+            return
+        try:
+            if age >= self.ttl_s:
+                self.build(force=True)
+            else:
+                self.refresh()
+        except Exception:
+            self.built_at = _time.time()     # do not retry on every single call
     def instances(self, class_name: str):
         """Either the mangled name ('22CNationalFocusDatabase') or the plain one."""
         plain = re.sub(r"^\d+", "", class_name)

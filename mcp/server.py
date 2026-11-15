@@ -134,6 +134,19 @@ def game() -> Game:
     return _g
 
 
+def verified(result, probe, label=""):
+    """Attach a read-back verdict to a write tool's result.
+
+    Nothing in the command channel proves the engine accepted an order, so a
+    write tool that cannot observe its own effect is reporting hope, not fact.
+    `verify.poll` watches the game clock as well as the observable: a frozen
+    clock yields `unverified`, never `rejected`, and `unverified` clears `ok`.
+    """
+    import verify as _v
+    state, detail, observed = _v.poll(probe, clock=lambda: game().date()["raw"])
+    return _v.attach(result, state, (label + ": " if label else "") + detail, observed)
+
+
 _doc_cache = None
 
 
@@ -577,7 +590,13 @@ def _ideas(a):
       "PP/prerequisites and deducts the cost; the result says method=replace/add.",
       dict(TAG, key=_STR, idea_id=_STR))
 def _add_idea(a):
-    return game().add_idea(a.get("idea_id") or a.get("key"), a.get("tag"))
+    import verify as _v
+    g = game()
+    key = a.get("idea_id") or a.get("key")
+    r = g.add_idea(key, a.get("tag"))
+    if isinstance(r, dict) and r.get("ok") is False:
+        return r
+    return verified(r, lambda: _v.idea_active(g, key, a.get("tag")), key)
 
 
 @tool("hoi4_province_ptr",
@@ -939,7 +958,14 @@ def _army_status(a):
       "lines=1..5 (the game silently caps some), state defaults to the capital.",
       dict(TAG, template=_STR, lines=_INT, state=_INT))
 def _train_divs(a):
-    return game().train_divisions(a.get("template"), a.get("lines", 2), a.get("state"), a.get("tag"))
+    import verify as _v
+    g = game()
+    tag = a.get("tag")
+    before = _v.conveyor_count(g, tag)
+    r = g.train_divisions(a.get("template"), a.get("lines", 2), a.get("state"), tag)
+    if isinstance(r, dict) and r.get("ok") is False:
+        return r
+    return verified(r, lambda: _v.conveyor_count(g, tag) > before, a.get("template"))
 
 
 @tool("hoi4_deploy_ready",
